@@ -39,7 +39,7 @@ class VpuDmaDescriptor(p: VpuParams) extends Bundle {
   *
   * spadElement identifies lane zero of this beat.  A wrapper must split a
   * response before it crosses a VPU lane word; this is naturally true for
-  * contiguous transfers because vector bases are VLEN aligned and
+  * contiguous transfers because vector bases are lane-word aligned and
   * dmaBusWidth divides the SRAM word width.
   */
 class VpuDmaReadBeat(p: VpuParams) extends Bundle {
@@ -85,17 +85,13 @@ class VpuDmaIO(p: VpuParams) extends Bundle {
 }
 
 class VpuSpadReadRequest(p: VpuParams) extends Bundle {
-  val address0 = UInt(p.elementAddrBits.W)
-  val address1 = UInt(p.elementAddrBits.W)
-  val useAddress1 = Bool()
+  val address = UInt(p.elementAddrBits.W)
   /** Opaque request identity, returned unchanged with the response. */
   val tag = UInt(p.spadReadTagBits.W)
 }
 
 class VpuSpadReadResponse(p: VpuParams) extends Bundle {
-  val data0 = Vec(p.nLanes, UInt(p.storageBits.W))
-  val data1 = Vec(p.nLanes, UInt(p.storageBits.W))
-  val serialized = Bool()
+  val data = Vec(p.nLanes, UInt(p.storageBits.W))
   val tag = UInt(p.spadReadTagBits.W)
 }
 
@@ -103,12 +99,4 @@ class VpuSpadWriteRequest(p: VpuParams) extends Bundle {
   val address = UInt(p.elementAddrBits.W)
   val data = Vec(p.nLanes, UInt(p.storageBits.W))
   val laneMask = Vec(p.nLanes, Bool())
-}
-
-class VpuHazardRange(p: VpuParams) extends Bundle {
-  val base = UInt(p.elementAddrBits.W)
-  val elementCount = UInt(p.vlBits.W)
-  val read = Bool()
-  val write = Bool()
-  val tag = UInt(log2Ceil(p.hazardEntries).W)
 }

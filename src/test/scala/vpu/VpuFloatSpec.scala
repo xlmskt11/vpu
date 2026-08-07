@@ -85,7 +85,7 @@ class VpuExpTester(c: VpuExpApprox) extends PeekPokeTester(c) {
   import VpuTestFloat._
 
   case class Stimulus(tag: Int, input: BigInt, label: String)
-  private val latency = 5
+  private val latency = VpuExpApprox.Latency
 
   private def check(stimulus: Stimulus): Unit = {
     val input = stimulus.input & BigInt("ffffffff", 16)
@@ -271,7 +271,7 @@ class VpuFloatSpec extends ChiselFlatSpec {
   }
 
   behavior of "VpuExpApprox"
-  it should "sustain II=1 at fixed five-cycle latency with bubbles and special values" in {
+  it should "sustain II=1 at fixed eight-cycle latency with bubbles and special values" in {
     chisel3.iotesters.Driver.execute(Array("--backend-name", "treadle",
       "--target-dir", "test_run_dir/vpu-exp"), () => new VpuExpApprox) {
       c => new VpuExpTester(c)

@@ -25,6 +25,12 @@ object VpuOpcode {
   val S_EXP_FP      = 0x1b
   val S_RECI_FP     = 0x1c
   val S_SQRT_FP     = 0x1d
+  val S_LOAD_STATE  = 0x1e
+  val S_STORE_STATE = 0x1f
+
+  // PLENA-compatible scalar-integer address induction.  Unlike the ordinary
+  // six-field microinstruction, bits [31:14] are an unsigned immediate.
+  val S_ADDI_INT    = 0x22
 
   val H_PREFETCH_V  = 0x29
   val H_STORE_V     = 0x2a
@@ -34,6 +40,11 @@ object VpuOpcode {
   // instead of requiring PLENA's scalar integer register file.
   val C_SET_STRIDE  = 0x2d
   val C_WRITE_VMASK = 0x2e
+  // PLENA-compatible hardware-loop delimiters. C_LOOP_START uses rd as the
+  // loop tag and bits [31:10] as a positive iteration count; C_LOOP_END only
+  // carries the matching rd.  VpuHardwareLoop consumes both before VpuCore.
+  val C_LOOP_START  = 0x2f
+  val C_LOOP_END    = 0x30
   val V_GATHER_VV   = 0x31
   val V_SLIDE_V     = 0x32
 
@@ -53,7 +64,9 @@ object VpuOpcode {
     V_ADD_VV, V_ADD_VF, V_SUB_VV, V_SUB_VF, V_MUL_VV, V_MUL_VF,
     V_EXP_V, V_RECI_V, V_RED_SUM, V_RED_MAX, V_MAX_VF, V_MIN_VF,
     S_ADD_FP, S_SUB_FP, S_MAX_FP, S_MUL_FP, S_EXP_FP, S_RECI_FP,
-    S_SQRT_FP, H_PREFETCH_V, H_STORE_V, C_SET_STRIDE, C_WRITE_VMASK,
+    S_SQRT_FP, S_LOAD_STATE, S_STORE_STATE, S_ADDI_INT,
+    H_PREFETCH_V, H_STORE_V, C_SET_STRIDE, C_WRITE_VMASK,
+    C_LOOP_START, C_LOOP_END,
     V_GATHER_VV,
     V_SLIDE_V, C_WRITE_GP, C_WRITE_FP,
     C_WRITE_H, C_SET_VL, C_WAIT, C_FENCE, C_READ, C_CLEAR_STATUS)
@@ -116,6 +129,7 @@ object VpuStatusLayout {
   val IllegalCommand = 0
   val DmaFault = 1
   val DmaHalted = 2
+  val FusionFault = 3
   val FflagsLo = 8
   val FflagsHi = 12
   val Busy = 16
@@ -129,6 +143,23 @@ object VpuEncoding {
     Seq(rd, rs1, rs2, rs3, funct1).foreach(x => require((x & ~0xf) == 0))
     opcode | (rd << 6) | (rs1 << 10) | (rs2 << 14) |
       (rs3 << 18) | (funct1 << 22)
+  }
+
+  def packAddiInt(rd: Int, rs1: Int, immediate: Int): Int = {
+    require((rd & ~0xf) == 0 && (rs1 & ~0xf) == 0)
+    require(immediate >= 0 && immediate < (1 << 18))
+    VpuOpcode.S_ADDI_INT | (rd << 6) | (rs1 << 10) | (immediate << 14)
+  }
+
+  def packLoopStart(loopRegister: Int, iterations: Int): Int = {
+    require((loopRegister & ~0xf) == 0)
+    require(iterations > 0 && iterations < (1 << 22))
+    VpuOpcode.C_LOOP_START | (loopRegister << 6) | (iterations << 10)
+  }
+
+  def packLoopEnd(loopRegister: Int): Int = {
+    require((loopRegister & ~0xf) == 0)
+    VpuOpcode.C_LOOP_END | (loopRegister << 6)
   }
 }
 
@@ -170,10 +201,18 @@ object VpuDecode {
   def isScalar(opcode: UInt): Bool = (opcode >= VpuOpcode.S_ADD_FP.U) &&
     (opcode <= VpuOpcode.S_SQRT_FP.U)
 
+  def isState(opcode: UInt): Bool =
+    opcode === VpuOpcode.S_LOAD_STATE.U ||
+      opcode === VpuOpcode.S_STORE_STATE.U
+
   def isLoad(opcode: UInt): Bool = opcode === VpuOpcode.H_PREFETCH_V.U
   def isStore(opcode: UInt): Bool = opcode === VpuOpcode.H_STORE_V.U
+  def isLoop(opcode: UInt): Bool =
+    opcode === VpuOpcode.C_LOOP_START.U ||
+      opcode === VpuOpcode.C_LOOP_END.U
   def isControl(opcode: UInt): Bool =
-    opcode === VpuOpcode.C_SET_STRIDE.U ||
+    opcode === VpuOpcode.S_ADDI_INT.U ||
+      opcode === VpuOpcode.C_SET_STRIDE.U ||
       opcode === VpuOpcode.C_WRITE_VMASK.U ||
       opcode >= VpuOpcode.C_WRITE_GP.U
 }
@@ -186,20 +225,44 @@ class VpuCommand extends Bundle {
   val status = new MStatus
 }
 
+/** Command envelope used by the hardware-loop transport.
+  *
+  * Group metadata is physically present only in a fused build.  Standalone
+  * VPUs still use the same loop frontend and retain the transport-malformed
+  * bit, but do not elaborate unused group ID/last wires into the loop buffer.
+  * The optional metadata is consumed by [[VpuGroupCommandGate]] and never
+  * enters the 32-bit PLENA-style microinstruction decoder.
+  */
+class VpuGroupedCommand(
+    groupIdBits: Int,
+    enableGroupedCommands: Boolean) extends Bundle {
+  val command = new VpuCommand
+  val groupId = if (enableGroupedCommands) Some(UInt(groupIdBits.W)) else None
+  val grouped = if (enableGroupedCommands) Some(Bool()) else None
+  val last = if (enableGroupedCommands) Some(Bool()) else None
+  val malformed = Bool()
+}
+
+/** VPU-side view of the LdBCompleteControl group handshake.
+  *
+  * `pending/groupId` query the group controller. A grouped command may enter
+  * the VPU reservation station once all Gemmini children are registered and
+  * `dispatchEnable` is asserted. The final two outputs are one-cycle
+  * notifications; in particular,
+  * `lastDispatchFire` is not asserted merely because RoCC accepted a command
+  * into the one-entry gate.
+  */
+class VpuGemvGroupIO(groupIdBits: Int) extends Bundle {
+  val pending = Output(Bool())
+  val groupId = Output(UInt(groupIdBits.W))
+  val groupAllocated = Input(Bool())
+  val dispatchEnable = Input(Bool())
+  val dispatchReject = Input(Bool())
+  val lastDispatchFire = Output(Bool())
+  val abort = Output(Bool())
+}
+
 class VpuResponse extends Bundle {
   val data = UInt(64.W)
   val rd = UInt(5.W)
-}
-
-class VpuCommandDecoder extends Module {
-  val io = IO(new Bundle {
-    val word = Input(UInt(32.W))
-    val decoded = Output(new VpuDecodedMicroOp)
-    val supported = Output(Bool())
-    val malformed = Output(Bool())
-  })
-
-  io.decoded := VpuDecode(io.word)
-  io.supported := VpuDecode.isSupported(io.decoded.opcode)
-  io.malformed := io.decoded.reserved.orR || !io.supported
 }

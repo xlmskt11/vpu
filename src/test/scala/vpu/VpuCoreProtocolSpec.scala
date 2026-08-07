@@ -10,6 +10,7 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
   import VpuTestFloat._
 
   poke(c.io.command.valid, 0)
+  poke(c.io.fusionFault.get, 0)
   poke(c.io.response.ready, 0)
   poke(c.io.dma.readDescriptor.ready, 1)
   poke(c.io.dma.readData.valid, 0)
@@ -53,6 +54,27 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
     poke(c.io.command.valid, 0)
   }
 
+  def issueRaw(microOp: Int, payload: BigInt = 0,
+               xd: Boolean = false, roccRd: Int = 0): Unit = {
+    poke(c.io.command.valid, 1)
+    poke(c.io.command.bits.microOp, BigInt(microOp & 0xffffffffL))
+    poke(c.io.command.bits.payload, payload)
+    poke(c.io.command.bits.rd, roccRd)
+    poke(c.io.command.bits.xd, xd)
+    poke(c.io.command.bits.status.dprv, 3)
+    poke(c.io.command.bits.status.dv, 0)
+    poke(c.io.command.bits.status.prv, 3)
+    poke(c.io.command.bits.status.v, 0)
+    var timeout = 200
+    while (peek(c.io.command.ready) == 0 && timeout > 0) {
+      step(1)
+      timeout -= 1
+    }
+    assert(timeout > 0, "raw VPU command enqueue timed out")
+    step(1)
+    poke(c.io.command.valid, 0)
+  }
+
   def response(expectedRd: Int, forbidNewDma: Boolean = false): BigInt = {
     var timeout = 1000
     while (peek(c.io.response.valid) == 0 && timeout > 0) {
@@ -72,6 +94,32 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
     step(1)
     poke(c.io.response.ready, 0)
     data
+  }
+
+  def issueRejected(opcode: Int, rd: Int = 0, rs1: Int = 0,
+                    rs2: Int = 0, payload: BigInt = 0): Unit = {
+    poke(c.io.command.valid, 1)
+    poke(c.io.command.bits.microOp,
+      BigInt(VpuEncoding.pack(opcode, rd, rs1, rs2) & 0xffffffffL))
+    poke(c.io.command.bits.payload, payload)
+    poke(c.io.command.bits.rd, 0)
+    poke(c.io.command.bits.xd, 0)
+    poke(c.io.command.bits.status.dprv, 3)
+    poke(c.io.command.bits.status.dv, 0)
+    poke(c.io.command.bits.status.prv, 3)
+    poke(c.io.command.bits.status.v, 0)
+    var timeout = 200
+    while (peek(c.io.command.ready) == 0 && timeout > 0) {
+      step(1)
+      timeout -= 1
+    }
+    assert(timeout > 0, "fault-discard command did not become ready")
+    assert(peek(c.io.commandRejected.get) == 1,
+      "fault-discarded command was not reported to the grouped wrapper")
+    assert(peek(c.io.commandRsAdmission.get) == 0,
+      "fault-discarded command unexpectedly allocated an RS entry")
+    step(1)
+    poke(c.io.command.valid, 0)
   }
 
   def waitReadDescriptor(expectedBase: Int, expectedCount: Int,
@@ -144,6 +192,11 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
   assert(((initialStatus >> VpuStatusLayout.Busy) & 1) == 0,
     "idle C_READ status reported itself busy")
 
+  poke(c.io.fusionFault.get, 1)
+  assert(((readStatus(1) >> VpuStatusLayout.FusionFault) & 1) == 1,
+    "group-gate fusion fault was not reflected in architectural status")
+  poke(c.io.fusionFault.get, 0)
+
   // S_MUL is binary just like ADD/SUB/MAX. rs2=8 must be rejected rather than
   // aliasing FP register zero through rs2(2,0).
   issue(VpuOpcode.C_WRITE_FP, rd = 0, payload = bits(2.0f))
@@ -183,6 +236,16 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
   assert(response(15) == 0x55, "malformed control command modified GP4")
   issue(VpuOpcode.C_CLEAR_STATUS, payload = VpuClearMask.Errors)
   assert((readStatus(16) & 1) == 0)
+
+  // The loop frontend relies on S_ADDI_INT to advance VSRAM/host/state
+  // cursors without another Rocket command per dynamic iteration.
+  issue(VpuOpcode.C_WRITE_GP, rd = 5, payload = 100)
+  issueRaw(VpuEncoding.packAddiInt(rd = 6, rs1 = 5, immediate = 28))
+  issue(VpuOpcode.C_READ, rd = 6, rs1 = VpuReadSelector.Gp,
+    xd = true, roccRd = 16)
+  assert(response(16) == 128,
+    "S_ADDI_INT did not update the selected GP register")
+
   issue(VpuOpcode.C_CLEAR_STATUS, payload = VpuClearMask.Perf)
   assert((readStatus(17) & 1) == 0,
     "PERF-only clear incorrectly modified illegal status")
@@ -225,6 +288,36 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
   }
   issue(VpuOpcode.C_FENCE, xd = true, roccRd = 5)
   assert((response(5) & 3) == 0, "legal final-row prefetch faulted")
+
+  // Fused Gemmini matrices expose one lane word per row.  A row such as
+  // base=nLanes is legal even though it is not an architectural VLEN-slot
+  // boundary.  Exercise both DMA writeback and a reduction from that row.
+  val matrixRowBase = p.nLanes
+  issue(VpuOpcode.C_SET_VL, payload = p.nLanes)
+  issue(VpuOpcode.C_WRITE_GP, rd = 0, payload = matrixRowBase)
+  issue(VpuOpcode.C_WRITE_FP, rd = 0, payload = bits(0.0f))
+  issue(VpuOpcode.H_PREFETCH_V, rd = 0, rs1 = 1, rs2 = 0)
+  waitReadDescriptor(matrixRowBase, p.nLanes)
+  readBeat(matrixRowBase, last = true, error = false,
+    data = BigInt("3f800000", 16))
+  issue(VpuOpcode.V_RED_SUM, rd = 0, rs1 = 0)
+  issue(VpuOpcode.C_FENCE, xd = true, roccRd = 26)
+  assert((response(26) & 3) == 0,
+    "lane-word-aligned matrix row was rejected")
+  issue(VpuOpcode.C_READ, rd = 0, rs1 = VpuReadSelector.Fp,
+    xd = true, roccRd = 27)
+  assert((response(27) & BigInt("ffffffff", 16)) == bits(1.0f),
+    "lane-word-aligned matrix-row reduction returned the wrong value")
+
+  // Less than one lane word of alignment remains illegal; otherwise the
+  // scratchpad would silently round the address down to a different row.
+  issue(VpuOpcode.C_WRITE_GP, rd = 0, payload = matrixRowBase + 1)
+  issue(VpuOpcode.V_RED_SUM, rd = 0, rs1 = 0)
+  issue(VpuOpcode.C_FENCE, xd = true, roccRd = 28)
+  assert((response(28) & 1) == 1,
+    "sub-lane-word VSRAM address was not rejected")
+  issue(VpuOpcode.C_CLEAR_STATUS, payload = VpuClearMask.Errors)
+  issue(VpuOpcode.C_WRITE_GP, rd = 0, payload = 0)
 
   // Cache-line alignment is not required, but storage-element alignment is.
   poke(c.io.dma.readDescriptor.ready, 0)
@@ -338,6 +431,16 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
   assert(((faultFence >> VpuStatusLayout.Busy) & 1) == 0,
     "drained fault FENCE reported busy")
 
+  // A legal fire-and-forget command presented while the sticky DMA fault is
+  // active is consumed without execution. The core must report that
+  // disposition so a grouped wrapper aborts/drains rather than silently
+  // losing an intermediate group command.
+  issueRejected(VpuOpcode.C_WRITE_GP, rd = 4, payload = 0xdead)
+  issue(VpuOpcode.C_READ, rd = 4, rs1 = VpuReadSelector.Gp,
+    xd = true, roccRd = 25)
+  assert(response(25) == 0x55,
+    "fault-discarded control command modified architectural state")
+
   issue(VpuOpcode.C_READ, rs1 = VpuReadSelector.FaultAddress,
     xd = true, roccRd = 11)
   assert(response(11) == failingVaddr, "first failing virtual address was lost")
@@ -375,7 +478,8 @@ class VpuCoreProtocolTester(c: VpuCore, p: VpuParams) extends PeekPokeTester(c) 
 class VpuCoreProtocolSpec extends ChiselFlatSpec {
   behavior of "VpuCore protocol and recovery"
   it should "validate registers, report idle, preserve final-row bounds, and drain faults" in {
-    val p = VpuParams(vLen = 16, nLanes = 4, sfuLanes = 2, vSpadKB = 1)
+    val p = VpuParams(vLen = 16, nLanes = 4, sfuLanes = 2, vSpadKB = 1,
+      enableGroupedCommands = true)
     chisel3.iotesters.Driver.execute(Array("--backend-name", "verilator",
       "--target-dir", "test_run_dir/vpu-core-protocol"), () => new VpuCore(p)) {
       c => new VpuCoreProtocolTester(c, p)

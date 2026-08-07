@@ -138,9 +138,9 @@ class VpuLoadLineMergerTester(c: VpuLoadLineMerger, p: VpuParams)
 
   // A 2-D descriptor keeps each four-element row in its own VLEN slot.  The
   // inactive lanes and the gap between rows must never become expected data.
-  descriptor(tag = 4, base = 64, elements = 4, rows = 2)
-  fragment(tag = 4, address = 64, values = Seq(60, 61, 62, 63))
-  fragment(tag = 4, address = 64 + p.vLen,
+  descriptor(tag = 1, base = 64, elements = 4, rows = 2)
+  fragment(tag = 1, address = 64, values = Seq(60, 61, 62, 63))
+  fragment(tag = 1, address = 64 + p.vLen,
     values = Seq(70, 71, 72, 73), last = true)
   waitForOutput()
   assert(peek(c.io.out.bits.address) == 64)
@@ -218,7 +218,7 @@ class VpuLoadLineMergerMaxRowsTester(c: VpuLoadLineMerger, p: VpuParams)
   poke(c.io.out.ready, 0)
   step(2)
 
-  val commandTag = 5
+  val commandTag = 0
   val rowElements = 125
   val hostBase = 4
   val hostStrideBytes = (p.vLen + 7) * p.storageBytes

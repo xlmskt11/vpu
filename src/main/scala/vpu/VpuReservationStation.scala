@@ -2,12 +2,11 @@ package vpu
 
 import chisel3._
 import chisel3.util._
+import gemmini.VsramClientIO
 
 /** The VSRAM accesses associated with one reservation-station entry.
-  *
-  * Unlike [[VpuHazardSet]], this bundle intentionally has no age or sequence
-  * number.  Allocation records dependencies directly as entry-tag bits, so
-  * command ordering cannot be affected by a wrapping counter.
+  * Allocation records dependencies directly as entry-tag bits, so no
+  * wrapping age or sequence number is stored in an entry.
   */
 class VpuRsAccessSet(p: VpuParams) extends Bundle {
   val accesses = Vec(3, new VpuHazardAccess(p))
@@ -30,17 +29,17 @@ class VpuStoreRsAlloc(p: VpuParams) extends Bundle {
 
 class VpuLoadRsIssue(p: VpuParams) extends Bundle {
   val command = new VpuLoadQueueEntry(p)
-  val tag = UInt(p.dmaCommandTagBits.W)
+  val tag = UInt(p.rsTagBits.W)
 }
 
 class VpuExecuteRsIssue(p: VpuParams) extends Bundle {
   val command = new VpuExecuteQueueEntry(p)
-  val tag = UInt(p.dmaCommandTagBits.W)
+  val tag = UInt(p.rsTagBits.W)
 }
 
 class VpuStoreRsIssue(p: VpuParams) extends Bundle {
   val command = new VpuStoreQueueEntry(p)
-  val tag = UInt(p.dmaCommandTagBits.W)
+  val tag = UInt(p.rsTagBits.W)
 }
 
 private[vpu] class VpuRsMetadata(p: VpuParams, totalEntries: Int)
@@ -72,11 +71,10 @@ object VpuReservationStation {
   // The former execute FIFO could hold p.execQueueEntries waiting commands in
   // addition to the command already resident in the execute engine.  An RS
   // entry lives through completion, so retain that externally visible credit.
-  def loadEntries(p: VpuParams): Int = p.loadQueueEntries
-  def executeEntries(p: VpuParams): Int = p.execQueueEntries + 1
-  def storeEntries(p: VpuParams): Int = p.storeQueueEntries
-  def totalEntries(p: VpuParams): Int =
-    loadEntries(p) + executeEntries(p) + storeEntries(p)
+  def loadEntries(p: VpuParams): Int = p.loadRsEntries
+  def executeEntries(p: VpuParams): Int = p.execRsEntries
+  def storeEntries(p: VpuParams): Int = p.storeRsEntries
+  def totalEntries(p: VpuParams): Int = p.hazardEntries
 
   val CompletionPorts = 8
 }
@@ -102,8 +100,8 @@ class VpuReservationStation(p: VpuParams) extends Module {
   private val exBase = nLd
   private val stBase = nLd + nEx
 
-  require(p.hazardEntries >= nTotal,
-    "hazardEntries must cover all live VPU reservation-station entries")
+  require(p.hazardEntries == nLd + nEx + nSt,
+    "derived global tag capacity must equal the VPU RS geometry")
 
   val io = IO(new Bundle {
     val allocate = new Bundle {
@@ -120,10 +118,14 @@ class VpuReservationStation(p: VpuParams) extends Module {
 
     /** Completion tags may be returned by independent engines in one cycle. */
     val complete = Flipped(Vec(CompletionPorts,
-      Valid(UInt(p.dmaCommandTagBits.W))))
+      Valid(UInt(p.rsTagBits.W))))
 
     /** Atomically discard commands which have not entered an engine yet. */
     val flushUnissued = Input(Bool())
+
+    val vsramDeps = if (p.enableSharedDeps) Some(
+      new VsramClientIO(
+        p.sharedHazardAddressBits, nTotal)) else None
 
     val validMask = Output(UInt(nTotal.W))
     val issuedMask = Output(UInt(nTotal.W))
@@ -133,6 +135,10 @@ class VpuReservationStation(p: VpuParams) extends Module {
     val storeValidMask = Output(UInt(nSt.W))
     val pendingFpReadMask = Output(UInt(8.W))
     val pendingFpWriteMask = Output(UInt(8.W))
+    // Every bit protects one immutable architectural mask version. Issued
+    // entries remain valid through completion, so this covers queued and active
+    // execute commands without a separately maintained reference counter.
+    val maskSlotsInUse = Output(UInt(p.maskSlots.W))
     val loadBusy = Output(Bool())
     val executeBusy = Output(Bool())
     val storeBusy = Output(Bool())
@@ -145,6 +151,13 @@ class VpuReservationStation(p: VpuParams) extends Module {
     0.U.asTypeOf(Valid(new VpuExecuteRsEntry(p, nTotal))))))
   val storeEntriesReg = RegInit(VecInit(Seq.fill(nSt)(
     0.U.asTypeOf(Valid(new VpuStoreRsEntry(p, nTotal))))))
+
+  if (p.enableSharedDeps) {
+    io.vsramDeps.get.allocate.valid := false.B
+    io.vsramDeps.get.allocate.bits :=
+      0.U.asTypeOf(io.vsramDeps.get.allocate.bits)
+    io.vsramDeps.get.release := 0.U
+  }
 
   private def accessEnd(x: VpuHazardAccess): UInt =
     x.base.pad(p.elementAddrBits + 1) +& x.elementCount
@@ -200,7 +213,7 @@ class VpuReservationStation(p: VpuParams) extends Module {
   // such as the default ST base (13, four bits) must therefore be widened
   // before adding a local ID: 13 + 3 is global tag 16, not four-bit zero.
   def globalTag(classBase: Int, localId: UInt): UInt =
-    classBase.U(p.dmaCommandTagBits.W) + localId
+    classBase.U(p.rsTagBits.W) + localId
 
   val completionMask = VecInit(io.complete.map { port =>
     Mux(port.valid, tagToOH(port.bits), 0.U(nTotal.W))
@@ -230,6 +243,9 @@ class VpuReservationStation(p: VpuParams) extends Module {
   val releaseMask = completionMask | flushMask
   io.flushedMask := flushMask
   val liveAfterRelease = allValid.asUInt & ~releaseMask
+  if (p.enableSharedDeps) {
+    io.vsramDeps.get.release := releaseMask
+  }
 
   // Allocation may recycle a completing slot in the same cycle.  It never
   // recycles a merely flushed slot because allocation is disabled on flush.
@@ -253,19 +269,65 @@ class VpuReservationStation(p: VpuParams) extends Module {
     io.allocate.store.fire)) <= 1.U,
     "VPU reservation station accepts at most one RoCC command per cycle")
 
+  if (p.enableSharedDeps) {
+    val allocationFires = Seq(io.allocate.load.fire,
+      io.allocate.execute.fire, io.allocate.store.fire)
+    val selectedSlot = Mux1H(Seq(
+      io.allocate.load.fire -> loadAllocId,
+      io.allocate.execute.fire -> globalTag(exBase, executeAllocId),
+      io.allocate.store.fire -> globalTag(stBase, storeAllocId)))
+    val selectedSet = Mux1H(Seq(
+      io.allocate.load.fire -> io.allocate.load.bits.accessSet,
+      io.allocate.execute.fire -> io.allocate.execute.bits.accessSet,
+      io.allocate.store.fire -> io.allocate.store.bits.accessSet))
+
+    io.vsramDeps.get.allocate.valid := allocationFires.reduce(_ || _)
+    io.vsramDeps.get.allocate.bits.slot := selectedSlot
+
+    for (accessIndex <- 0 until 3) {
+      val local = selectedSet.accesses(accessIndex)
+      val rangeWidth = math.max(p.elementAddrBits,
+        p.dmaTransferElementsBits) + 1
+      val base = local.base.pad(rangeWidth)
+      val count = local.elementCount.pad(rangeWidth)
+      val endElement = base +& count
+      val startRow = base / p.nLanes.U
+      val endRow = (endElement + (p.nLanes - 1).U) / p.nLanes.U
+      val shared = io.vsramDeps.get.allocate.bits.accesses(accessIndex)
+
+      shared.valid := local.elementCount =/= 0.U &&
+        (local.read || local.write)
+      shared.start := startRow
+      shared.end := endRow
+      shared.wraps_around := false.B
+      shared.read := local.read
+      shared.write := local.write
+
+      when (io.vsramDeps.get.allocate.valid && shared.valid) {
+        assert(endElement <= p.totalElements.U,
+          "VPU shared dependency range escaped VSRAM")
+        assert(endRow <= p.totalWords.U,
+          "VPU shared dependency matrix-row range escaped VSRAM")
+      }
+    }
+  }
+
   // A dependency chain, rather than physical index order, identifies the
   // oldest ready entry even after arbitrary slots have been recycled.
-  val loadReady = VecInit(loadEntriesReg.map { entry =>
+  val loadReady = VecInit(loadEntriesReg.zipWithIndex.map { case (entry, slot) =>
     entry.valid && !entry.bits.metadata.issued &&
-      !entry.bits.metadata.deps.orR
+      !entry.bits.metadata.deps.orR &&
+      (if (p.enableSharedDeps) io.vsramDeps.get.ready(slot) else true.B)
   })
-  val executeReady = VecInit(executeEntriesReg.map { entry =>
+  val executeReady = VecInit(executeEntriesReg.zipWithIndex.map { case (entry, slot) =>
     entry.valid && !entry.bits.metadata.issued &&
-      !entry.bits.metadata.deps.orR
+      !entry.bits.metadata.deps.orR &&
+      (if (p.enableSharedDeps) io.vsramDeps.get.ready(exBase + slot) else true.B)
   })
-  val storeReady = VecInit(storeEntriesReg.map { entry =>
+  val storeReady = VecInit(storeEntriesReg.zipWithIndex.map { case (entry, slot) =>
     entry.valid && !entry.bits.metadata.issued &&
-      !entry.bits.metadata.deps.orR
+      !entry.bits.metadata.deps.orR &&
+      (if (p.enableSharedDeps) io.vsramDeps.get.ready(stBase + slot) else true.B)
   })
   val loadIssueOH = PriorityEncoderOH(loadReady)
   val executeIssueOH = PriorityEncoderOH(executeReady)
@@ -342,6 +404,17 @@ class VpuReservationStation(p: VpuParams) extends Module {
   io.pendingFpWriteMask := executeEntriesReg.map { entry =>
     Mux(entry.valid, entry.bits.command.fpWriteMask, 0.U(8.W))
   }.reduce(_ | _)
+  io.maskSlotsInUse := executeEntriesReg.map { entry =>
+    Mux(entry.valid && entry.bits.command.maskEnable,
+      UIntToOH(entry.bits.command.maskSlot, p.maskSlots),
+      0.U(p.maskSlots.W))
+  }.reduce(_ | _)
+
+  when(io.allocate.execute.fire &&
+      io.allocate.execute.bits.command.maskEnable) {
+    assert(io.allocate.execute.bits.command.maskSlot < p.maskSlots.U,
+      "VPU execute command selected an invalid vector-mask slot")
+  }
 
   // Existing entries first consume all completion/flush releases and then the
   // issue-time clear for their own class.  A same-class actual conflict is

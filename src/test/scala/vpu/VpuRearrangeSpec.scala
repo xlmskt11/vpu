@@ -8,8 +8,11 @@ class VpuRearrangeTester(c: VpuRearrangeUnit, p: VpuParams)
 
   private val memory = Array.fill[BigInt](p.totalElements)(0)
   poke(c.io.start.valid, 0)
-  poke(c.io.readRequest.ready, 1)
-  poke(c.io.readResponse.valid, 0)
+  for (operand <- 0 until 2) {
+    poke(c.io.readRequest(operand).ready, 1)
+    poke(c.io.readResponse(operand).valid, 0)
+  }
+  poke(c.io.maskWord, 0)
   poke(c.io.writeRequest.ready, 1)
   step(3)
 
@@ -21,8 +24,9 @@ class VpuRearrangeTester(c: VpuRearrangeUnit, p: VpuParams)
   private def readVector(base: Int): Seq[BigInt] =
     (0 until p.vLen).map(index => memory(base + index))
 
-  private case class PendingRead(data0: Seq[BigInt], data1: Seq[BigInt],
-                                 serialized: Boolean, tag: BigInt)
+  private case class PendingRead(data: Seq[BigInt], tag: BigInt)
+  private val requestCount = Array.fill(2)(0)
+  private val responseCount = Array.fill(2)(0)
 
   private def run(gather: Boolean, slideLow: Boolean, destination: Int,
                   source: Int, indices: Int = 0, shift: Int = 0,
@@ -36,46 +40,49 @@ class VpuRearrangeTester(c: VpuRearrangeUnit, p: VpuParams)
     poke(c.io.start.bits.shift, shift)
     poke(c.io.start.bits.elementCount, p.vLen)
     poke(c.io.start.bits.maskEnable, if (maskEnable) 1 else 0)
-    poke(c.io.start.bits.vectorMask, mask)
+    poke(c.io.maskWord, mask & ((BigInt(1) << p.nLanes) - 1))
     poke(c.io.start.valid, 1)
     while (peek(c.io.start.ready) == 0) { step(1) }
     step(1)
     poke(c.io.start.valid, 0)
 
-    var pending: Option[PendingRead] = None
+    val pending = Array.fill[Option[PendingRead]](2)(None)
     var timeout = 10000
     var finished = false
     while (!finished && timeout > 0) {
-      pending match {
-        case Some(response) =>
-          poke(c.io.readResponse.valid, 1)
-          response.data0.zipWithIndex.foreach { case (value, lane) =>
-            poke(c.io.readResponse.bits.data0(lane), value)
-          }
-          response.data1.zipWithIndex.foreach { case (value, lane) =>
-            poke(c.io.readResponse.bits.data1(lane), value)
-          }
-          poke(c.io.readResponse.bits.serialized,
-            if (response.serialized) 1 else 0)
-          poke(c.io.readResponse.bits.tag, response.tag)
-        case None => poke(c.io.readResponse.valid, 0)
+      val maskWordIndex = peek(c.io.maskWordIndex).toInt
+      val maskWord = (mask >> (maskWordIndex * p.nLanes)) &
+        ((BigInt(1) << p.nLanes) - 1)
+      poke(c.io.maskWord, maskWord)
+      for (operand <- 0 until 2) {
+        pending(operand) match {
+          case Some(response) =>
+            poke(c.io.readResponse(operand).valid, 1)
+            response.data.zipWithIndex.foreach { case (value, lane) =>
+              poke(c.io.readResponse(operand).bits.data(lane), value)
+            }
+            poke(c.io.readResponse(operand).bits.tag, response.tag)
+          case None => poke(c.io.readResponse(operand).valid, 0)
+        }
       }
 
-      val responseFire = pending.nonEmpty &&
-        peek(c.io.readResponse.ready) == 1
-      val requestFire = peek(c.io.readRequest.valid) == 1 &&
-        peek(c.io.readRequest.ready) == 1
-      val newPending = if (requestFire) {
-        val address0 = peek(c.io.readRequest.bits.address0).toInt
-        val address1 = peek(c.io.readRequest.bits.address1).toInt
-        val useAddress1 = peek(c.io.readRequest.bits.useAddress1) == 1
-        val data0 = (0 until p.nLanes).map(lane => memory(address0 + lane))
-        val data1 = if (useAddress1)
-          (0 until p.nLanes).map(lane => memory(address1 + lane))
-        else Seq.fill(p.nLanes)(BigInt(0))
-        Some(PendingRead(data0, data1, useAddress1,
-          peek(c.io.readRequest.bits.tag)))
-      } else None
+      val responseFire = (0 until 2).map { operand =>
+        pending(operand).nonEmpty &&
+          peek(c.io.readResponse(operand).ready) == 1
+      }
+      val newPending = (0 until 2).map { operand =>
+        val requestFire = peek(c.io.readRequest(operand).valid) == 1 &&
+          peek(c.io.readRequest(operand).ready) == 1
+        if (requestFire) {
+          assert(pending(operand).isEmpty,
+            s"operand $operand issued another read before its response")
+          val address = peek(c.io.readRequest(operand).bits.address).toInt
+          requestCount(operand) += 1
+          Some(PendingRead(
+            (0 until p.nLanes).map(lane => memory(address + lane)),
+            peek(c.io.readRequest(operand).bits.tag)))
+        } else None
+      }
 
       if (peek(c.io.writeRequest.valid) == 1 &&
           peek(c.io.writeRequest.ready) == 1) {
@@ -88,10 +95,18 @@ class VpuRearrangeTester(c: VpuRearrangeUnit, p: VpuParams)
       }
       finished = peek(c.io.done) == 1
       step(1)
-      pending = if (responseFire) newPending else pending.orElse(newPending)
+      for (operand <- 0 until 2) {
+        if (responseFire(operand)) responseCount(operand) += 1
+        pending(operand) = if (responseFire(operand)) newPending(operand)
+        else pending(operand).orElse(newPending(operand))
+      }
       timeout -= 1
     }
-    poke(c.io.readResponse.valid, 0)
+    for (operand <- 0 until 2) {
+      poke(c.io.readResponse(operand).valid, 0)
+      assert(pending(operand).isEmpty,
+        s"operand $operand still had a response when the command completed")
+    }
     assert(timeout > 0, "VPU rearrange command timed out")
     assert(peek(c.io.busy) == 0)
   }
@@ -138,6 +153,11 @@ class VpuRearrangeTester(c: VpuRearrangeUnit, p: VpuParams)
     else original(index.toInt)
   }
   assert(readVector(destination) == expectedGather)
+
+  // Slides that cross a lane-word boundary must use and consume both
+  // independent operand ports. Gather intentionally remains on operand 0.
+  assert(requestCount(0) > 0 && responseCount(0) == requestCount(0))
+  assert(requestCount(1) > 0 && responseCount(1) == requestCount(1))
 }
 
 class VpuRearrangeSpec extends ChiselFlatSpec {

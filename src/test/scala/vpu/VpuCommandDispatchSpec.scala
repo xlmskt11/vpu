@@ -305,7 +305,7 @@ class VpuCommandDispatchSpec extends ChiselFlatSpec {
   it should "admit dependent EX and independent memory work without HOL stalls" in {
     val p = VpuParams(vLen = 16, nLanes = 4, sfuLanes = 2,
       vSpadKB = 1, loadQueueEntries = 2, execQueueEntries = 4,
-      storeQueueEntries = 2, hazardEntries = 9)
+      storeQueueEntries = 2)
     chisel3.iotesters.Driver.execute(Array("--backend-name", "verilator",
       "--target-dir", "test_run_dir/vpu-command-dispatch"),
       () => new VpuCore(p)) { c =>

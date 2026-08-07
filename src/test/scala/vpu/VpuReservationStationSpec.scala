@@ -36,7 +36,6 @@ class VpuReservationStationTester(c: VpuReservationStation, p: VpuParams)
     poke(c.io.allocate.load.bits.command.spadBase, base)
     poke(c.io.allocate.load.bits.command.elementCount, count)
     poke(c.io.allocate.load.bits.command.hazardTag, 0)
-    poke(c.io.allocate.load.bits.command.sequence, id)
     access(c.io.allocate.load.bits.accessSet, base, count,
       read = false, write = true)
     poke(c.io.allocate.load.valid, 1)
@@ -47,7 +46,9 @@ class VpuReservationStationTester(c: VpuReservationStation, p: VpuParams)
   }
 
   private def allocExecute(id: Int, base: Int, count: Int = 16,
-                           readFp: Int = 0, writeFp: Int = 0): Unit = {
+                           readFp: Int = 0, writeFp: Int = 0,
+                           maskEnable: Boolean = false,
+                           maskSlot: Int = 0): Unit = {
     val cmd = c.io.allocate.execute.bits.command
     poke(cmd.opcode, VpuOpcode.V_MUL_VF)
     poke(cmd.funct1, 0)
@@ -56,19 +57,17 @@ class VpuReservationStationTester(c: VpuReservationStation, p: VpuParams)
     poke(cmd.source1, 0)
     poke(cmd.elementCount, count)
     poke(cmd.useSource1, 0)
+    poke(cmd.maskEnable, if (maskEnable) 1 else 0)
+    poke(cmd.maskSlot, maskSlot)
+    poke(cmd.gpRs2Value, 0)
     poke(cmd.fpRs1, 0)
     poke(cmd.fpRs2, 0)
     poke(cmd.fpSeed, 0)
     poke(cmd.fpReadMask, readFp)
     poke(cmd.fpWriteMask, writeFp)
-    poke(cmd.scalarA, 0)
-    poke(cmd.scalarB, 0)
-    poke(cmd.scalarSeed, 0)
-    poke(cmd.writesFp, if (writeFp != 0) 1 else 0)
+    poke(cmd.stateIndex, 0)
     poke(cmd.fpDestination, 0)
-    poke(cmd.hasHazard, 1)
     poke(cmd.hazardTag, 0)
-    poke(cmd.sequence, id)
     access(c.io.allocate.execute.bits.accessSet, base, count,
       read = true, write = false)
     poke(c.io.allocate.execute.valid, 1)
@@ -85,7 +84,6 @@ class VpuReservationStationTester(c: VpuReservationStation, p: VpuParams)
     poke(c.io.allocate.store.bits.command.elementCount, count)
     poke(c.io.allocate.store.bits.command.hazardTag, 0)
     poke(c.io.allocate.store.bits.command.transportTag, 0)
-    poke(c.io.allocate.store.bits.command.sequence, id)
     access(c.io.allocate.store.bits.accessSet, base, count,
       read = true, write = false)
     poke(c.io.allocate.store.valid, 1)
@@ -165,6 +163,21 @@ class VpuReservationStationTester(c: VpuReservationStation, p: VpuParams)
   assert(peek(c.io.pendingFpReadMask) == 0)
   assert(peek(c.io.pendingFpWriteMask) == 0)
 
+  // A mask slot remains protected after issue and is released only when the
+  // execute entry completes. Unmasked entries never reserve a mask version.
+  allocExecute(7, base = 288, maskEnable = true, maskSlot = 2)
+  assert(peek(c.io.maskSlotsInUse) == 0x4,
+    "masked execute did not protect its snapshotted mask slot")
+  val maskedExecute = peek(c.io.issue.execute.bits.tag)
+  poke(c.io.issue.execute.ready, 1)
+  step(1)
+  poke(c.io.issue.execute.ready, 0)
+  assert(peek(c.io.maskSlotsInUse) == 0x4,
+    "issuing a masked execute released its mask slot too early")
+  complete(Seq(maskedExecute))
+  assert(peek(c.io.maskSlotsInUse) == 0,
+    "completed execute retained a stale mask-slot reference")
+
   // Both ST slots are live and issued. Recycle one completion tag while a new
   // command is allocated in the same cycle; the new entry must not depend on
   // its own reused tag.
@@ -242,7 +255,7 @@ class VpuReservationStationSpec extends ChiselFlatSpec {
   it should "schedule with explicit dependencies and no wrapping age" in {
     val p = VpuParams(vLen = 16, nLanes = 4, sfuLanes = 2,
       loadQueueEntries = 4, execQueueEntries = 8,
-      storeQueueEntries = 4, hazardEntries = 17)
+      storeQueueEntries = 4)
     chisel3.iotesters.Driver.execute(Array("--backend-name", "treadle",
       "--target-dir", "test_run_dir/vpu-reservation-station"),
       () => new VpuReservationStation(p)) { c =>

@@ -9,9 +9,7 @@ class VpuBankedScratchpadTester(c: VpuBankedScratchpad, p: VpuParams)
 
   private def idleRead(client: Int): Unit = {
     poke(c.io.readRequest(client).valid, 0)
-    poke(c.io.readRequest(client).bits.address0, 0)
-    poke(c.io.readRequest(client).bits.address1, 0)
-    poke(c.io.readRequest(client).bits.useAddress1, 0)
+    poke(c.io.readRequest(client).bits.address, 0)
     poke(c.io.readRequest(client).bits.tag, 0)
   }
 
@@ -24,13 +22,9 @@ class VpuBankedScratchpadTester(c: VpuBankedScratchpad, p: VpuParams)
     }
   }
 
-  private def driveRead(client: Int, address0: Int, address1: Int,
-      useAddress1: Boolean, tag: Int): Unit = {
+  private def driveRead(client: Int, address: Int, tag: Int): Unit = {
     poke(c.io.readRequest(client).valid, 1)
-    poke(c.io.readRequest(client).bits.address0, address0)
-    poke(c.io.readRequest(client).bits.address1, address1)
-    poke(c.io.readRequest(client).bits.useAddress1,
-      if (useAddress1) 1 else 0)
+    poke(c.io.readRequest(client).bits.address, address)
     poke(c.io.readRequest(client).bits.tag, tag)
   }
 
@@ -53,6 +47,9 @@ class VpuBankedScratchpadTester(c: VpuBankedScratchpad, p: VpuParams)
     idleWrite(client)
   }
 
+  private def setResponseReady(client: Int, ready: Boolean): Unit =
+    poke(c.io.readResponse(client).ready, if (ready) 1 else 0)
+
   private def waitResponse(client: Int, timeoutLimit: Int = 20): Unit = {
     var timeout = timeoutLimit
     while (peek(c.io.readResponse(client).valid) == 0 && timeout > 0) {
@@ -62,25 +59,25 @@ class VpuBankedScratchpadTester(c: VpuBankedScratchpad, p: VpuParams)
     assert(timeout > 0, s"read client $client response timeout")
   }
 
-  private def checkResponse(client: Int, expected0: Seq[Int],
-      expected1: Option[Seq[Int]], tag: Int, serialized: Boolean): Unit = {
+  private def checkResponse(client: Int, expected: Seq[Int],
+      tag: Int): Unit = {
     assert(peek(c.io.readResponse(client).valid) == 1)
     assert(peek(c.io.readResponse(client).bits.tag) == tag)
-    assert(peek(c.io.readResponse(client).bits.serialized) ==
-      (if (serialized) 1 else 0))
     for (lane <- 0 until p.nLanes) {
-      assert(peek(c.io.readResponse(client).bits.data0(lane)) ==
-        expected0(lane))
-      expected1.foreach { values =>
-        assert(peek(c.io.readResponse(client).bits.data1(lane)) ==
-          values(lane))
-      }
+      assert(peek(c.io.readResponse(client).bits.data(lane)) ==
+        expected(lane))
     }
+  }
+
+  private def drainResponse(client: Int): Unit = {
+    setResponseReady(client, ready = true)
+    step(1)
+    setResponseReady(client, ready = false)
   }
 
   for (client <- 0 until NumReadClients) {
     idleRead(client)
-    poke(c.io.readResponse(client).ready, 0)
+    setResponseReady(client, ready = false)
   }
   for (client <- 0 until NumWriteClients) idleWrite(client)
   step(2)
@@ -96,68 +93,63 @@ class VpuBankedScratchpadTester(c: VpuBankedScratchpad, p: VpuParams)
   writeOne(ExecuteWriteClient, p.vLen, bank0b)
   writeOne(ExecuteWriteClient, 2 * p.vLen, bank0c)
   writeOne(ExecuteWriteClient, p.elementsPerBank, bank1a)
+  writeOne(ExecuteWriteClient, 2 * p.elementsPerBank, bank2a)
+  writeOne(ExecuteWriteClient, 3 * p.elementsPerBank, bank3a)
 
-  // Both read clients and both write clients use disjoint banks in one cycle.
-  driveRead(ExecuteReadClient, 0, 0, useAddress1 = false, tag = 1)
-  driveRead(StoreReadClient, p.elementsPerBank, 0,
-    useAddress1 = false, tag = 2)
+  // Source 0, source 1, and store can all consume one word in the same cycle
+  // when their addresses map to three different physical banks.
+  driveRead(Source0ReadClient, 0, tag = 1)
+  driveRead(Source1ReadClient, p.elementsPerBank, tag = 2)
+  driveRead(StoreReadClient, 2 * p.elementsPerBank, tag = 3)
   driveWrite(ExecuteWriteClient, 2 * p.elementsPerBank, bank2a)
   driveWrite(LoadWriteClient, 3 * p.elementsPerBank, bank3a)
   for (client <- 0 until NumReadClients) {
     assert(peek(c.io.readRequest(client).ready) == 1,
-      "disjoint read clients were not accepted together")
+      s"disjoint read client $client was not accepted")
   }
   for (client <- 0 until NumWriteClients) {
     assert(peek(c.io.writeRequest(client).ready) == 1,
-      "disjoint write clients were not accepted together")
+      s"disjoint write client $client was not accepted")
   }
   step(1)
   for (client <- 0 until NumReadClients) idleRead(client)
   for (client <- 0 until NumWriteClients) idleWrite(client)
 
-  waitResponse(ExecuteReadClient)
+  waitResponse(Source0ReadClient)
+  waitResponse(Source1ReadClient)
   waitResponse(StoreReadClient)
-  checkResponse(ExecuteReadClient, bank0a, None, tag = 1,
-    serialized = false)
-  checkResponse(StoreReadClient, bank1a, None, tag = 2,
-    serialized = false)
+  checkResponse(Source0ReadClient, bank0a, tag = 1)
+  checkResponse(Source1ReadClient, bank1a, tag = 2)
+  checkResponse(StoreReadClient, bank2a, tag = 3)
 
-  // Independent response queues: ST may drain while EX is held stable.
-  poke(c.io.readResponse(StoreReadClient).ready, 1)
-  step(1)
-  poke(c.io.readResponse(StoreReadClient).ready, 0)
+  // Every client owns an independent response queue. Drain source 1 and the
+  // store while source 0 is backpressured, then prove source 0 remains stable.
+  drainResponse(Source1ReadClient)
+  drainResponse(StoreReadClient)
   for (_ <- 0 until 3) {
-    checkResponse(ExecuteReadClient, bank0a, None, tag = 1,
-      serialized = false)
+    checkResponse(Source0ReadClient, bank0a, tag = 1)
     step(1)
   }
-  poke(c.io.readResponse(ExecuteReadClient).ready, 1)
-  step(1)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 0)
+  drainResponse(Source0ReadClient)
+  assert(peek(c.io.busy) == 0)
 
-  // Verify the two simultaneous writes through two simultaneous reads.
-  driveRead(ExecuteReadClient, 2 * p.elementsPerBank, 0,
-    useAddress1 = false, tag = 3)
-  driveRead(StoreReadClient, 3 * p.elementsPerBank, 0,
-    useAddress1 = false, tag = 4)
-  assert(peek(c.io.readRequest(ExecuteReadClient).ready) == 1)
+  // Verify the two simultaneous writes through independent read clients.
+  driveRead(Source0ReadClient, 2 * p.elementsPerBank, tag = 4)
+  driveRead(StoreReadClient, 3 * p.elementsPerBank, tag = 5)
+  assert(peek(c.io.readRequest(Source0ReadClient).ready) == 1)
   assert(peek(c.io.readRequest(StoreReadClient).ready) == 1)
   step(1)
-  idleRead(ExecuteReadClient)
+  idleRead(Source0ReadClient)
   idleRead(StoreReadClient)
-  waitResponse(ExecuteReadClient)
+  waitResponse(Source0ReadClient)
   waitResponse(StoreReadClient)
-  checkResponse(ExecuteReadClient, bank2a, None, tag = 3,
-    serialized = false)
-  checkResponse(StoreReadClient, bank3a, None, tag = 4,
-    serialized = false)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 1)
-  poke(c.io.readResponse(StoreReadClient).ready, 1)
-  step(1)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 0)
-  poke(c.io.readResponse(StoreReadClient).ready, 0)
+  checkResponse(Source0ReadClient, bank2a, tag = 4)
+  checkResponse(StoreReadClient, bank3a, tag = 5)
+  drainResponse(Source0ReadClient)
+  drainResponse(StoreReadClient)
 
-  // A same-bank write conflict alternates owners instead of starving one.
+  // A same-bank write conflict alternates ownership rather than admitting two
+  // requests to the bank's single write port.
   val write0 = (0 until p.nLanes).map(_ + 130)
   val write1 = (0 until p.nLanes).map(_ + 150)
   driveWrite(ExecuteWriteClient, 3 * p.vLen, write0)
@@ -173,87 +165,55 @@ class VpuBankedScratchpadTester(c: VpuBankedScratchpad, p: VpuParams)
   idleWrite(ExecuteWriteClient)
   idleWrite(LoadWriteClient)
 
-  // Read conflicts use the same fair RR policy on the single bank read port.
-  driveRead(ExecuteReadClient, 0, 0, useAddress1 = false, tag = 10)
-  driveRead(StoreReadClient, p.vLen, 0, useAddress1 = false, tag = 11)
-  assert(peek(c.io.readRequest(ExecuteReadClient).ready) == 1)
-  assert(peek(c.io.readRequest(StoreReadClient).ready) == 0)
-  assert(peek(c.io.readConflictStall) == 1)
-  step(1)
-  assert(peek(c.io.readRequest(ExecuteReadClient).ready) == 0)
-  assert(peek(c.io.readRequest(StoreReadClient).ready) == 1)
-  assert(peek(c.io.readConflictStall) == 1)
-  step(1)
-  idleRead(ExecuteReadClient)
-  idleRead(StoreReadClient)
-  waitResponse(ExecuteReadClient)
-  waitResponse(StoreReadClient)
-  checkResponse(ExecuteReadClient, bank0a, None, tag = 10,
-    serialized = false)
-  checkResponse(StoreReadClient, bank0b, None, tag = 11,
-    serialized = false)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 1)
-  poke(c.io.readResponse(StoreReadClient).ready, 1)
-  step(1)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 0)
-  poke(c.io.readResponse(StoreReadClient).ready, 0)
+  // Three reads in one bank serialize. Keep each Decoupled request asserted
+  // until it fires and verify that exactly one bank access occurs per cycle.
+  val sameBankAddresses = Seq(0, p.vLen, 2 * p.vLen)
+  val sameBankTags = Seq(10, 11, 12)
+  val sameBankData = Seq(bank0a, bank0b, bank0c)
+  for (client <- 0 until NumReadClients) {
+    driveRead(client, sameBankAddresses(client), sameBankTags(client))
+  }
+  val pending = Array.fill(NumReadClients)(true)
+  var cycles = 0
+  while (pending.contains(true) && cycles < 10) {
+    val granted = (0 until NumReadClients).filter { client =>
+      pending(client) && peek(c.io.readRequest(client).ready) == 1
+    }
+    assert(granted.size == 1,
+      s"expected one same-bank read grant, observed ${granted.size}")
+    assert(peek(c.io.readConflictStall) ==
+      (if (pending.count(_ == true) > 1) 1 else 0))
+    step(1)
+    granted.foreach { client =>
+      pending(client) = false
+      idleRead(client)
+    }
+    cycles += 1
+  }
+  assert(!pending.contains(true), "same-bank read arbitration starved a client")
 
-  // Equal VV addresses use one bank read and broadcast the returned word.
-  driveRead(ExecuteReadClient, 0, 0, useAddress1 = true, tag = 20)
-  assert(peek(c.io.readRequest(ExecuteReadClient).ready) == 1)
-  step(1)
-  idleRead(ExecuteReadClient)
-  waitResponse(ExecuteReadClient)
-  checkResponse(ExecuteReadClient, bank0a, Some(bank0a), tag = 20,
-    serialized = false)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 1)
-  step(1)
-  poke(c.io.readResponse(ExecuteReadClient).ready, 0)
+  for (client <- 0 until NumReadClients) {
+    waitResponse(client)
+    checkResponse(client, sameBankData(client), sameBankTags(client))
+  }
 
-  // Distinct words in one bank consume two read cycles. The continuation owns
-  // the bank, then the waiting other client is accepted in the capture cycle.
-  driveRead(ExecuteReadClient, 0, 2 * p.vLen,
-    useAddress1 = true, tag = 30)
-  assert(peek(c.io.readRequest(ExecuteReadClient).ready) == 1)
-  step(1)
-  idleRead(ExecuteReadClient)
-  driveRead(StoreReadClient, p.vLen, 0,
-    useAddress1 = false, tag = 31)
-  assert(peek(c.io.serializedRead(ExecuteReadClient)) == 1,
-    "serializedRead did not pulse on the second bank-read cycle")
-  assert(peek(c.io.readRequest(StoreReadClient).ready) == 0,
-    "another client entered a bank reserved by a serialized continuation")
-  step(1)
-  assert(peek(c.io.serializedRead(ExecuteReadClient)) == 0)
-  assert(peek(c.io.readRequest(StoreReadClient).ready) == 1,
-    "waiting client did not enter on the serialized capture cycle")
-  step(1)
-  idleRead(StoreReadClient)
-  waitResponse(ExecuteReadClient)
-  waitResponse(StoreReadClient)
-  checkResponse(ExecuteReadClient, bank0a, Some(bank0c), tag = 30,
-    serialized = true)
-  checkResponse(StoreReadClient, bank0b, None, tag = 31,
-    serialized = false)
-
-  // Hold both final responses and confirm all visible fields stay unchanged.
+  // Hold all responses and confirm their independently tagged data is stable.
   for (_ <- 0 until 3) {
-    checkResponse(ExecuteReadClient, bank0a, Some(bank0c), tag = 30,
-      serialized = true)
-    checkResponse(StoreReadClient, bank0b, None, tag = 31,
-      serialized = false)
+    for (client <- 0 until NumReadClients) {
+      checkResponse(client, sameBankData(client), sameBankTags(client))
+    }
     step(1)
   }
-  poke(c.io.readResponse(ExecuteReadClient).ready, 1)
-  poke(c.io.readResponse(StoreReadClient).ready, 1)
+  for (client <- 0 until NumReadClients) setResponseReady(client, ready = true)
   step(1)
+  for (client <- 0 until NumReadClients) setResponseReady(client, ready = false)
   assert(peek(c.io.busy) == 0)
 }
 
 class VpuBankedScratchpadSpec extends ChiselFlatSpec {
   behavior of "VpuBankedScratchpad"
 
-  it should "arbitrate bank-local 1R1W clients without losing responses" in {
+  it should "arbitrate independent bank-local read clients without losing responses" in {
     val p = VpuParams(vLen = 16, nLanes = 4, sfuLanes = 2)
     chisel3.iotesters.Driver.execute(Array("--backend-name", "treadle",
       "--target-dir", "test_run_dir/vpu-banked-scratchpad"),

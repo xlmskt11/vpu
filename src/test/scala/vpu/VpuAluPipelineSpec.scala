@@ -110,6 +110,32 @@ class VpuAluPipelineTester(c: VpuCore, p: VpuParams)
     cycles.toSeq
   }
 
+  // Read issue and writeback overlap once the ALU pipeline fills. Observe both
+  // in the same cycle window so a same-bank read cadence cannot hide an early
+  // writeback while the test is still waiting for the final read request.
+  def collectAluActivity(count: Int,
+                         timeoutLimit: Int = 300): (Seq[Int], Seq[Int]) = {
+    val reads = ArrayBuffer.empty[Int]
+    val writes = ArrayBuffer.empty[Int]
+    var cycle = 0
+    while ((reads.size < count || writes.size < count) &&
+        cycle < timeoutLimit) {
+      if (peek(c.io.debugAluReadIssue) == 1 && reads.size < count) {
+        reads += cycle
+      }
+      if (peek(c.io.debugAluWriteback) == 1 && writes.size < count) {
+        writes += cycle
+      }
+      step(1)
+      cycle += 1
+    }
+    assert(reads.size == count,
+      s"saw ${reads.size}/$count ALU read pulses in $timeoutLimit cycles")
+    assert(writes.size == count,
+      s"saw ${writes.size}/$count ALU writeback pulses in $timeoutLimit cycles")
+    (reads.toSeq, writes.toSeq)
+  }
+
   def store(spadBase: Int, expected: Seq[Float]): Unit = {
     poke(c.io.dma.writeDescriptor.ready, 1)
     issue(VpuOpcode.H_STORE_V, rd = 2, rs1 = 15, rs2 = 0)
@@ -185,10 +211,9 @@ class VpuAluPipelineTester(c: VpuCore, p: VpuParams)
   issue(VpuOpcode.V_ADD_VV, rd = 2, rs1 = 0, rs2 = 1)
 
   val beats = p.wordsPerVector
-  val readCycles = collectPulseCycles(peek(c.io.debugAluReadIssue), beats)
+  val (readCycles, writeCycles) = collectAluActivity(beats)
   assert(readCycles.sliding(2).forall(pair => pair(1) - pair(0) == 1),
     s"disjoint-bank ALU reads were not II=1: $readCycles")
-  val writeCycles = collectPulseCycles(peek(c.io.debugAluWriteback), beats)
   assert(writeCycles.sliding(2).forall(pair => pair(1) - pair(0) == 1),
     s"ALU writeback was not II=1: $writeCycles")
   store(destination, sum)
@@ -201,11 +226,12 @@ class VpuAluPipelineTester(c: VpuCore, p: VpuParams)
   issue(VpuOpcode.C_WRITE_GP, rd = 1, payload = sourceSameBank)
   issue(VpuOpcode.C_WRITE_GP, rd = 2, payload = destination)
   issue(VpuOpcode.V_ADD_VV, rd = 2, rs1 = 0, rs2 = 1)
-  val conflictReadCycles = collectPulseCycles(
-    peek(c.io.debugAluReadIssue), beats)
+  val (conflictReadCycles, conflictWriteCycles) = collectAluActivity(beats)
   assert(conflictReadCycles.sliding(2).forall(pair => pair(1) - pair(0) == 2),
     s"same-bank reads did not use maximal two-cycle cadence: $conflictReadCycles")
-  collectPulseCycles(peek(c.io.debugAluWriteback), beats)
+  assert(conflictWriteCycles.sliding(2).forall(pair => pair(1) - pair(0) == 2),
+    s"same-bank ALU writebacks did not follow the operand cadence: " +
+      conflictWriteCycles)
   assert(peek(c.io.perfCounters(VpuPerfIndex.BankConflictStallCycles)) >= beats,
     "same-bank VV operation did not increment bankConflictStall")
   store(destination, sum)

@@ -43,6 +43,8 @@ class VpuElaborationSpec extends AnyFlatSpec {
       vLen = 96, nLanes = 12, sfuLanes = 3, vSpadKB = 3,
       dmaBusWidth = 96))
     assertThrows[IllegalArgumentException](VpuParams(fmaPipeDepth = 3))
+    assertThrows[IllegalArgumentException](VpuParams(loopBufferEntries = 3))
+    assertThrows[IllegalArgumentException](VpuParams(loopStackDepth = 3))
   }
 
   it should "generate exact FP32 and BF16 software parameter headers" in {
@@ -56,19 +58,70 @@ class VpuElaborationSpec extends AnyFlatSpec {
     assert(fp32.contains("#define VPU_STORAGE_KIND VPU_STORAGE_FP32"))
     assert(fp32.contains("#define VPU_COMPUTE_KIND VPU_STORAGE_FP32"))
     assert(fp32.contains("#define VPU_FMA_PIPE_DEPTH 4u"))
+    assert(VpuConfigs.default.dmaReadMergeEntries == 18)
+    assert(fp32.contains("#define VPU_DMA_READ_MERGE_ENTRIES 18u"))
+    assert(VpuConfigs.default.rsTagBits == 5)
+    assert(VpuConfigs.default.dmaCommandTagBits == 2)
+    assert(fp32.contains("#define VPU_RS_TAG_BITS 5u"))
+    assert(fp32.contains("#define VPU_DMA_COMMAND_TAG_BITS 2u"))
+    assert(fp32.contains("#define VPU_LOOP_BUFFER_ENTRIES 64u"))
+    assert(fp32.contains("#define VPU_LOOP_STACK_DEPTH 4u"))
+    assert(!fp32.contains("VPU_STREAM_CHUNK_ROWS"))
+    assert(!fp32.contains("VPU_NONLINEAR_CHUNK_ROWS"))
+    assert(fp32.contains("#define VPU_STORAGE_BYTES (VPU_STORAGE_BITS / 8u)"))
+    assert(fp32.contains("#define VPU_ELEMENTS_PER_BANK"))
+    assert(fp32.contains("#define VPU_SLOT_ADDR(bank_, slot_)"))
 
     val bf16 = VpuConfigs.bf16Storage.generateHeader()
     assert(bf16.contains("#define VPU_STORAGE_BF16 1"))
     assert(bf16.contains("#define VPU_STORAGE_KIND VPU_STORAGE_BF16"))
-    assert(VpuConfigs.default.headerFileName == "vpu_params_generated.h")
-    assert(VpuConfigs.bf16Storage.headerFileName ==
-      "vpu_params_bf16_generated.h")
-    assert(VpuConfigs.default.headerFilePath !=
+    assert(VpuConfigs.default.headerFilePath ==
       VpuConfigs.bf16Storage.headerFilePath)
-    assert(fp32.contains("#ifndef VPU_PARAMS_GENERATED_H_"))
-    assert(bf16.contains("#ifndef VPU_PARAMS_BF16_GENERATED_H_"))
+    assert(VpuConfigs.default.headerFilePath.endsWith("/vpu_params.h"))
+    assert(fp32.contains(
+      "#ifndef GEMMINI_ROCC_TESTS_INCLUDE_VPU_PARAMS_H_"))
+    assert(bf16.contains(
+      "#ifndef GEMMINI_ROCC_TESTS_INCLUDE_VPU_PARAMS_H_"))
+
+    val fusion = VpuConfigs.default.copy(
+      vSpadKB = 128, vSpadSubBanks = 4, matrixPorts = 4,
+      enableSharedDeps = true, enableGroupedCommands = true)
+    val fusionHeader = fusion.generateHeader()
+    assert(fusionHeader.contains("#define VPU_VSPAD_KIB 128u"))
+    assert(fusionHeader.contains("#define VPU_VSPAD_SUBBANKS 4u"))
+    assert(fusionHeader.contains("#define VPU_MATRIX_PORTS 4u"))
+    assert(fusionHeader.contains("#define VPU_SHARED_DEPS 1u"))
+    assert(fusionHeader.contains("#define VPU_GROUPED_COMMANDS 1u"))
+    assert(fusion.headerFilePath == VpuConfigs.default.headerFilePath)
     assert(VpuConfigs.default.reciprocalLanes == 4)
     assert(VpuConfigs.default.reciprocalLatency == 13)
+
+    val resizedRs = VpuConfigs.default.copy(
+      loadQueueEntries = 2, execQueueEntries = 3, storeQueueEntries = 5)
+    assert(resizedRs.loadRsEntries == 2)
+    assert(resizedRs.execRsEntries == 4)
+    assert(resizedRs.storeRsEntries == 5)
+    assert(resizedRs.hazardEntries == 11)
+    assert(resizedRs.generateHeader().contains(
+      "#define VPU_HAZARD_ENTRIES 11u"))
+  }
+
+
+  it should "elaborate the configurable loop command buffer and stack" in {
+    val p = VpuConfigs.default.copy(
+      loopBufferEntries = 128, loopStackDepth = 8)
+    val chirrtl = (new ChiselStage).emitChirrtl(new VpuHardwareLoop(
+      groupIdBits = p.groupIdBits,
+      enableGroupedCommands = p.enableGroupedCommands,
+      bufferEntries = p.loopBufferEntries,
+      maxDepth = p.loopStackDepth))
+    assert(chirrtl.contains("module VpuHardwareLoop"))
+    assert(!chirrtl.contains("captureGrouped"))
+    assert(!chirrtl.contains("captureGroupId"))
+    assert(!chirrtl.contains("drainEmitTerminator"))
+    assert(p.generateHeader().contains(
+      "#define VPU_LOOP_BUFFER_ENTRIES 128u"))
+    assert(p.generateHeader().contains("#define VPU_LOOP_STACK_DEPTH 8u"))
   }
 
   it should "elaborate reciprocal arithmetic only inside the shared fabric" in {

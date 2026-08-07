@@ -5,12 +5,12 @@ import chisel3.util._
 
 /** One correctness-first slide/gather command for the existing 1R1W VSRAM.
   *
-  * Slide consumes at most two contiguous source lane words for each output
-  * word and therefore maps directly onto [[VpuSpadReadRequest]]'s two-address
-  * interface. A same-bank pair is serialized by [[VpuBankedScratchpad]].
-  * Gather first reads one raw-index word and then performs one source-word
-  * read per active destination lane. This deliberately modest implementation
-  * adds no multiported gather register file or SRAM crossbar.
+  * Slide independently requests the at-most-two contiguous source lane words
+  * needed by one output word. Different banks can return both words together;
+  * a shared bank arbitrates them one at a time, exactly like Gemmini's
+  * independent operand streams. Gather uses source-0 for its index and source
+  * reads. This deliberately modest implementation adds no multiported gather
+  * register file or SRAM crossbar.
   */
 class VpuRearrangeCommand(p: VpuParams) extends Bundle {
   val gather = Bool()
@@ -23,7 +23,6 @@ class VpuRearrangeCommand(p: VpuParams) extends Bundle {
   val shift = UInt(32.W)
   val elementCount = UInt(p.vlBits.W)
   val maskEnable = Bool()
-  val vectorMask = UInt(p.vLen.W)
 }
 
 class VpuRearrangeUnit(p: VpuParams) extends Module {
@@ -31,8 +30,14 @@ class VpuRearrangeUnit(p: VpuParams) extends Module {
 
   val io = IO(new Bundle {
     val start = Flipped(Decoupled(new VpuRearrangeCommand(p)))
-    val readRequest = Decoupled(new VpuSpadReadRequest(p))
-    val readResponse = Flipped(Decoupled(new VpuSpadReadResponse(p)))
+    val readRequest = Vec(2, Decoupled(new VpuSpadReadRequest(p)))
+    val readResponse = Flipped(Vec(2,
+      Decoupled(new VpuSpadReadResponse(p))))
+    // The architectural mask file supplies only the lane word used by the
+    // current output word. Keeping a complete VLEN-bit mask in this active
+    // command would duplicate state merely because rearrange is iterative.
+    val maskWordIndex = Output(UInt(p.maskWordIndexBits.W))
+    val maskWord = Input(UInt(p.nLanes.W))
     val writeRequest = Decoupled(new VpuSpadWriteRequest(p))
     val done = Output(Bool())
     val busy = Output(Bool())
@@ -47,23 +52,29 @@ class VpuRearrangeUnit(p: VpuParams) extends Module {
   val gatherLane = RegInit(0.U(laneIndexBits.W))
   val indexWord = Reg(Vec(p.nLanes, UInt(p.storageBits.W)))
   val resultWord = Reg(Vec(p.nLanes, UInt(p.storageBits.W)))
+  val slideSource0Requested = RegInit(false.B)
+  val slideSource1Requested = RegInit(false.B)
 
   io.start.ready := state === sIdle
   io.done := false.B
   io.busy := state =/= sIdle
-  io.readRequest.valid := false.B
-  io.readRequest.bits := 0.U.asTypeOf(io.readRequest.bits)
-  io.readResponse.ready := false.B
+  for (operand <- 0 until 2) {
+    io.readRequest(operand).valid := false.B
+    io.readRequest(operand).bits :=
+      0.U.asTypeOf(io.readRequest(operand).bits)
+    io.readResponse(operand).ready := false.B
+  }
   io.writeRequest.valid := false.B
   io.writeRequest.bits := 0.U.asTypeOf(io.writeRequest.bits)
 
-  private val maskBits = VecInit(command.vectorMask.asBools)
+  io.maskWordIndex := (wordOffset / p.nLanes.U)(p.maskWordIndexBits - 1, 0)
+  private val maskBits = VecInit(io.maskWord.asBools)
   private def outputIndex(lane: Int): UInt =
     wordOffset.pad(p.vlBits + 1) + lane.U
   private def outputActive(lane: Int): Bool = {
     val index = outputIndex(lane)
     val inVl = index < command.elementCount
-    val selected = maskBits(index(p.vlBits - 1, 0))
+    val selected = maskBits(lane)
     inVl && (!command.maskEnable || selected)
   }
 
@@ -92,6 +103,8 @@ class VpuRearrangeUnit(p: VpuParams) extends Module {
   when(io.start.fire) {
     command := io.start.bits
     gatherLane := 0.U
+    slideSource0Requested := false.B
+    slideSource1Requested := false.B
     for (lane <- 0 until p.nLanes) {
       resultWord(lane) := 0.U
     }
@@ -111,6 +124,8 @@ class VpuRearrangeUnit(p: VpuParams) extends Module {
 
   when(state === sSlidePrepare) {
     when(slideHasSource) {
+      slideSource0Requested := false.B
+      slideSource1Requested := false.B
       state := sSlideReadRequest
     }.otherwise {
       for (lane <- 0 until p.nLanes) {
@@ -120,32 +135,55 @@ class VpuRearrangeUnit(p: VpuParams) extends Module {
     }
   }
 
-  io.readRequest.valid := state === sSlideReadRequest ||
-    state === sGatherIndexRequest || state === sGatherSourceRequest
-  io.readRequest.bits.address0 := MuxLookup(state, 0.U, Seq(
+  private val slideNeedsSource1 = slideLastWord32 =/= slideFirstWord32
+  io.readRequest(0).valid :=
+    (state === sSlideReadRequest && !slideSource0Requested) ||
+      state === sGatherIndexRequest || state === sGatherSourceRequest
+  io.readRequest(0).bits.address := MuxLookup(state, 0.U, Seq(
     sSlideReadRequest ->
       (command.source + slideFirstWord32(p.elementAddrBits - 1, 0)),
     sGatherIndexRequest -> (command.indices + wordOffset),
     sGatherSourceRequest -> (command.source +
       ((indexWord(gatherLane) / p.nLanes.U) * p.nLanes.U))))
-  io.readRequest.bits.address1 := command.source +
+  io.readRequest(0).bits.tag := 0.U
+  io.readRequest(1).valid := state === sSlideReadRequest &&
+    slideNeedsSource1 && !slideSource1Requested
+  io.readRequest(1).bits.address := command.source +
     slideLastWord32(p.elementAddrBits - 1, 0)
-  io.readRequest.bits.useAddress1 := state === sSlideReadRequest &&
-    slideLastWord32 =/= slideFirstWord32
-  io.readRequest.bits.tag := 0.U
+  io.readRequest(1).bits.tag := 0.U
 
-  when(io.readRequest.fire) {
+  when(io.readRequest(0).fire) {
     switch(state) {
-      is(sSlideReadRequest) { state := sSlideReadResponse }
       is(sGatherIndexRequest) { state := sGatherIndexResponse }
       is(sGatherSourceRequest) { state := sGatherSourceResponse }
     }
   }
+  when(state === sSlideReadRequest && io.readRequest(0).fire) {
+    slideSource0Requested := true.B
+  }
+  when(state === sSlideReadRequest && io.readRequest(1).fire) {
+    slideSource1Requested := true.B
+  }
+  val slideSource0RequestDone = slideSource0Requested ||
+    io.readRequest(0).fire
+  val slideSource1RequestDone = !slideNeedsSource1 ||
+    slideSource1Requested || io.readRequest(1).fire
+  when(state === sSlideReadRequest && slideSource0RequestDone &&
+      slideSource1RequestDone) {
+    state := sSlideReadResponse
+  }
 
-  io.readResponse.ready := state === sSlideReadResponse ||
-    state === sGatherIndexResponse || state === sGatherSourceResponse
-  when(io.readResponse.fire) {
-    when(state === sSlideReadResponse) {
+  val slideResponsesAvailable = io.readResponse(0).valid &&
+    (!slideNeedsSource1 || io.readResponse(1).valid)
+  io.readResponse(0).ready :=
+    (state === sSlideReadResponse && slideResponsesAvailable) ||
+      state === sGatherIndexResponse || state === sGatherSourceResponse
+  io.readResponse(1).ready := state === sSlideReadResponse &&
+    slideNeedsSource1 && slideResponsesAvailable
+  val slideResponseFire = state === sSlideReadResponse &&
+    io.readResponse(0).fire &&
+    (!slideNeedsSource1 || io.readResponse(1).fire)
+  when(slideResponseFire) {
       for (lane <- 0 until p.nLanes) {
         val out = outputIndex(lane).pad(32)
         val sourceValid = Mux(command.slideLow,
@@ -157,21 +195,21 @@ class VpuRearrangeUnit(p: VpuParams) extends Module {
         val sourceWord = (sourceIndex / p.nLanes.U) * p.nLanes.U
         val sourceLane = sourceIndex % p.nLanes.U
         val selectedWord = Mux(sourceWord === slideFirstWord32,
-          io.readResponse.bits.data0, io.readResponse.bits.data1)
+          io.readResponse(0).bits.data, io.readResponse(1).bits.data)
         resultWord(lane) := Mux(sourceValid,
           selectedWord(sourceLane), 0.U)
       }
       state := sWrite
-    }.elsewhen(state === sGatherIndexResponse) {
-      indexWord := io.readResponse.bits.data0
+  }.elsewhen(state === sGatherIndexResponse && io.readResponse(0).fire) {
+      indexWord := io.readResponse(0).bits.data
       gatherLane := 0.U
       state := sGatherLane
-    }.otherwise {
+  }.elsewhen(state === sGatherSourceResponse &&
+      io.readResponse(0).fire) {
       val sourceLane = indexWord(gatherLane) % p.nLanes.U
-      resultWord(gatherLane) := io.readResponse.bits.data0(sourceLane)
+      resultWord(gatherLane) := io.readResponse(0).bits.data(sourceLane)
       gatherLane := gatherLane + 1.U
       state := sGatherLane
-    }
   }
 
   when(state === sGatherLane) {

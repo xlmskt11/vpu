@@ -46,6 +46,10 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
     private val requestBeatBits =
       math.max(1, log2Ceil(maxBeatsPerRequest))
     private val pendingBits = math.max(1, log2Ceil(nSources + 1))
+    // VpuCore remaps store RS tags onto a compact zero-based transport-tag
+    // pool. Keep the global tag width at the boundary, but size per-command
+    // state by the number of store transports that can actually be live.
+    private val commandTagCapacity = vpuParams.storeRsEntries
 
     require(requestMaxBytes >= beatBytes &&
       requestMaxBytes % beatBytes == 0)
@@ -76,15 +80,15 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
     val commandOrder = Module(new Queue(
       UInt(vpuParams.dmaCommandTagBits.W), vpuParams.storeQueueEntries))
     val commandActive = RegInit(VecInit(
-      Seq.fill(vpuParams.hazardEntries)(false.B)))
+      Seq.fill(commandTagCapacity)(false.B)))
     // InputDone records the architectural last payload beat.  Sealed is
     // stronger: every byte has reached a source-owned transaction buffer.
     val commandInputDone = RegInit(VecInit(
-      Seq.fill(vpuParams.hazardEntries)(false.B)))
+      Seq.fill(commandTagCapacity)(false.B)))
     val commandSealed = RegInit(VecInit(
-      Seq.fill(vpuParams.hazardEntries)(false.B)))
+      Seq.fill(commandTagCapacity)(false.B)))
     val commandPendingTransactions = RegInit(VecInit(Seq.fill(
-      vpuParams.hazardEntries)(0.U(pendingBits.W))))
+      commandTagCapacity)(0.U(pendingBits.W))))
 
     val faultPending = RegInit(false.B)
     val faultVaddr = Reg(UInt(64.W))
@@ -93,7 +97,7 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
     val descriptorDiscardMode = Wire(Bool())
 
     val incomingTag = io.descriptor.bits.commandTag
-    val incomingTagInRange = incomingTag < vpuParams.hazardEntries.U
+    val incomingTagInRange = incomingTag < commandTagCapacity.U
     val incomingTagFree = incomingTagInRange && !commandActive(incomingTag)
     val descriptorCanEnter = descriptorQueue.io.enq.ready &&
       commandOrder.io.enq.ready && incomingTagFree &&
@@ -111,7 +115,7 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
 
     when(io.descriptor.valid) {
       assert(incomingTagInRange,
-        "VPU writer descriptor command tag is outside the hazard table")
+        "VPU writer descriptor command tag is outside the store-tag table")
       val rows = Mux(io.descriptor.bits.rowCount === 0.U,
         1.U, io.descriptor.bits.rowCount)
       val footprintEnd = io.descriptor.bits.spadElement.pad(
@@ -284,7 +288,7 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
     // Tagged Core payload stream and protocol checking
     // ----------------------------------------------------------------------
     val inputTag = io.data.bits.commandTag
-    val inputTagInRange = inputTag < vpuParams.hazardEntries.U
+    val inputTagInRange = inputTag < commandTagCapacity.U
     val inputTagActive = inputTagInRange && commandActive(inputTag)
     val inputValidElements = PopCount(io.data.bits.elementMask)
     val inputValidBytes = inputValidElements * vpuParams.storageBytes.U
@@ -329,7 +333,7 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
 
     when(io.data.valid) {
       assert(inputTagInRange,
-        "VPU writer payload command tag is outside the hazard table")
+        "VPU writer payload command tag is outside the store-tag table")
       assert(!faultPending || inputTagActive,
         "VPU writer fault drain received an inactive command tag")
     }
@@ -587,7 +591,7 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
 
     // A source reservation and one or more releases may affect the same
     // command in one cycle.  Update each pending count exactly once.
-    for (tag <- 0 until vpuParams.hazardEntries) {
+    for (tag <- 0 until commandTagCapacity) {
       val reserveForTag = reserveAssembly &&
         fillDescriptor.commandTag === tag.U
       val releasesForTag = PopCount((0 until nSources).map { source =>
@@ -636,7 +640,7 @@ private[vpu] class VpuTLWriterPipelined(vpuParams: VpuParams)
     io.completion.bits := completionBits
 
     val retirementTag = commandOrder.io.deq.bits
-    val retirementTagInRange = retirementTag < vpuParams.hazardEntries.U
+    val retirementTagInRange = retirementTag < commandTagCapacity.U
     val normalRetirementReady = retirementTagInRange &&
       commandActive(retirementTag) && commandSealed(retirementTag) &&
       commandPendingTransactions(retirementTag) === 0.U

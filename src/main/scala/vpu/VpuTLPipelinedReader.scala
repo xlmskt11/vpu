@@ -63,6 +63,9 @@ private[vpu] class VpuTLReaderPipelined(vpuParams: VpuParams)
     private val requestBytesBits = log2Ceil(requestMaxBytes + 1)
     private val responseBeatBits =
       math.max(1, log2Ceil(maxBeatsPerRequest + 1))
+    // Reader command tags are the load RS's zero-based global tags. Keep the
+    // transport width global, but only elaborate state for reachable tags.
+    private val commandTagCapacity = vpuParams.loadRsEntries
 
     require(requestMaxBytes >= beatBytes &&
       requestMaxBytes % beatBytes == 0)
@@ -90,19 +93,19 @@ private[vpu] class VpuTLReaderPipelined(vpuParams: VpuParams)
     val descriptorQueue = Module(new Queue(
       new VpuDmaDescriptor(vpuParams), vpuParams.loadQueueEntries))
     val commandActive = RegInit(VecInit(
-      Seq.fill(vpuParams.hazardEntries)(false.B)))
+      Seq.fill(commandTagCapacity)(false.B)))
     val commandElementsToGenerate = Reg(Vec(
-      vpuParams.hazardEntries,
+      commandTagCapacity,
       UInt(vpuParams.dmaTransferElementsBits.W)))
     val zeroCompletionPending = RegInit(VecInit(
-      Seq.fill(vpuParams.hazardEntries)(false.B)))
+      Seq.fill(commandTagCapacity)(false.B)))
     val faultPending = RegInit(false.B)
     val faultVaddr = Reg(UInt(64.W))
     val faultCause = Reg(UInt(2.W))
 
     val descriptorAdmissionBlocked = Wire(Bool())
     val incomingTag = io.descriptor.bits.commandTag
-    val incomingTagInRange = incomingTag < vpuParams.hazardEntries.U
+    val incomingTagInRange = incomingTag < commandTagCapacity.U
     val incomingTagFree = incomingTagInRange && !commandActive(incomingTag)
     descriptorQueue.io.enq.valid := io.descriptor.valid && incomingTagFree &&
       !descriptorAdmissionBlocked
@@ -112,7 +115,7 @@ private[vpu] class VpuTLReaderPipelined(vpuParams: VpuParams)
 
     when(io.descriptor.valid) {
       assert(incomingTagInRange,
-        "VPU reader descriptor command tag is outside the hazard table")
+        "VPU reader descriptor command tag is outside the load-tag table")
       val rows = Mux(io.descriptor.bits.rowCount === 0.U,
         1.U, io.descriptor.bits.rowCount)
       val footprintEnd = io.descriptor.bits.spadElement.pad(
@@ -545,7 +548,7 @@ private[vpu] class VpuTLReaderPipelined(vpuParams: VpuParams)
       faultPending := true.B
       requestActive := false.B
       commitActive := false.B
-      for (tag <- 0 until vpuParams.hazardEntries) {
+      for (tag <- 0 until commandTagCapacity) {
         zeroCompletionPending(tag) := false.B
       }
       // Requests already visible on A and translations already presented to

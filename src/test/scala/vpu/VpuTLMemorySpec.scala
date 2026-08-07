@@ -749,7 +749,7 @@ private class VpuTLMemoryTester(c: VpuTLMemoryHarnessImp, p: VpuParams)
 
   // A later host row may fault even though the first row completed. Report the
   // actual failing row address, not the descriptor base or dense local offset.
-  val stridedFaultTag = 4
+  val stridedFaultTag = 0
   val stridedFaultBase = BigInt(0xffc0)
   val stridedFaultStride = BigInt(0x80)
   val expectedSecondRowFault = stridedFaultBase + stridedFaultStride

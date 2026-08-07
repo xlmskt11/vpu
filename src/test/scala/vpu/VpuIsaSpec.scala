@@ -14,7 +14,15 @@ class VpuIsaSpec extends AnyFlatSpec {
     assert(p.wordsPerVector == 8)
     assert(p.dmaElementsPerBeat == 4)
     assert(p.vectorMaskChunks == 2)
+    assert(p.maskSlots == 4)
+    assert(p.maskSlotBits == 2)
     assert(p.gatherIndexBits == 7)
+    assert(p.fpStateEntries == 256)
+    assert(p.fpStateBanks == 4)
+    assert(p.loopBufferEntries == 64)
+    assert(p.loopStackDepth == 4)
+    assert(p.groupIdBits == 3)
+    assert(p.generateHeader().contains("#define VPU_MASK_SLOTS 4u"))
   }
 
   it should "use BF16 (8,8) storage geometry" in {
@@ -37,7 +45,12 @@ class VpuIsaSpec extends AnyFlatSpec {
   }
 
   it should "reserve the agreed control and status ABI" in {
+    assert(VpuOpcode.S_ADDI_INT == 0x22)
+    assert(VpuOpcode.C_LOOP_START == 0x2f)
+    assert(VpuOpcode.C_LOOP_END == 0x30)
     assert(VpuOpcode.C_WRITE_GP == 0x38)
+    assert(VpuOpcode.S_LOAD_STATE == 0x1e)
+    assert(VpuOpcode.S_STORE_STATE == 0x1f)
     assert(VpuOpcode.C_WRITE_VMASK == 0x2e)
     assert(VpuOpcode.V_GATHER_VV == 0x31)
     assert(VpuOpcode.V_SLIDE_V == 0x32)
@@ -57,5 +70,25 @@ class VpuIsaSpec extends AnyFlatSpec {
     assert(VpuStatusLayout.DmaHalted == 2)
     assert(VpuStatusLayout.FflagsLo == 8)
     assert(VpuStatusLayout.Busy == 16)
+  }
+
+  it should "pack PLENA-compatible integer induction and loop formats" in {
+    val addi = VpuEncoding.packAddiInt(rd = 7, rs1 = 3,
+      immediate = 0x2aaaa)
+    assert((addi & 0x3f) == VpuOpcode.S_ADDI_INT)
+    assert(((addi >>> 6) & 0xf) == 7)
+    assert(((addi >>> 10) & 0xf) == 3)
+    assert((addi >>> 14) == 0x2aaaa)
+
+    val start = VpuEncoding.packLoopStart(loopRegister = 12,
+      iterations = 0x2abcde)
+    assert((start & 0x3f) == VpuOpcode.C_LOOP_START)
+    assert(((start >>> 6) & 0xf) == 12)
+    assert((start >>> 10) == 0x2abcde)
+
+    val end = VpuEncoding.packLoopEnd(loopRegister = 12)
+    assert((end & 0x3f) == VpuOpcode.C_LOOP_END)
+    assert(((end >>> 6) & 0xf) == 12)
+    assert((end >>> 10) == 0)
   }
 }

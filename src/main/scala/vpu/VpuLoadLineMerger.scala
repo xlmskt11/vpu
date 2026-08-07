@@ -56,8 +56,15 @@ class VpuDmaReadWord(p: VpuParams) extends Bundle {
 class VpuLoadLineMerger(
     p: VpuParams,
     nEntries: Int = -1) extends Module {
+  private val commandTagCapacity = p.loadRsEntries
+  // The reader serializes one completed TL line into the merger while its
+  // bounded completed-line queue waits upstream. The merger therefore needs
+  // staging for that response window, not one entry for every word of every
+  // load descriptor. The derived bound also covers an unaligned transaction
+  // touching multiple VSRAM words; ordinary Decoupled backpressure stops the
+  // unpacker when the entries fill.
   private val entriesCount =
-    if (nEntries > 0) nEntries else p.loadQueueEntries * p.wordsPerVector
+    if (nEntries > 0) nEntries else p.dmaReadMergeEntries
   private val entryIndexBits = math.max(1, log2Ceil(entriesCount))
   private val wordsRemainingBits = p.dmaTransferWordsBits
   private val wordsPerRowBits = math.max(1, log2Ceil(p.wordsPerVector + 1))
@@ -74,30 +81,30 @@ class VpuLoadLineMerger(
   })
 
   val descriptorActive = RegInit(VecInit(
-    Seq.fill(p.hazardEntries)(false.B)))
+    Seq.fill(commandTagCapacity)(false.B)))
   val descriptorBase = Reg(Vec(
-    p.hazardEntries, UInt(p.elementAddrBits.W)))
+    commandTagCapacity, UInt(p.elementAddrBits.W)))
   val descriptorElements = Reg(Vec(
-    p.hazardEntries, UInt(p.vlBits.W)))
+    commandTagCapacity, UInt(p.vlBits.W)))
   val descriptorRows = Reg(Vec(
-    p.hazardEntries, UInt(p.dmaRowCountBits.W)))
+    commandTagCapacity, UInt(p.dmaRowCountBits.W)))
   val descriptorWordsRemaining = Reg(Vec(
-    p.hazardEntries, UInt(wordsRemainingBits.W)))
+    commandTagCapacity, UInt(wordsRemainingBits.W)))
   val descriptorElementsReceived = Reg(Vec(
-    p.hazardEntries, UInt(p.dmaTransferElementsBits.W)))
+    commandTagCapacity, UInt(p.dmaTransferElementsBits.W)))
   val descriptorDropping = RegInit(VecInit(
-    Seq.fill(p.hazardEntries)(false.B)))
-  val descriptorFault = Reg(Vec(p.hazardEntries, new VpuDmaFaultInfo))
+    Seq.fill(commandTagCapacity)(false.B)))
+  val descriptorFault = Reg(Vec(commandTagCapacity, new VpuDmaFaultInfo))
 
   val descriptorTag = io.descriptor.bits.commandTag
-  val descriptorTagInRange = descriptorTag < p.hazardEntries.U
+  val descriptorTagInRange = descriptorTag < commandTagCapacity.U
   val descriptorTagFree = descriptorTagInRange &&
     !descriptorActive(descriptorTag)
   io.descriptor.ready := descriptorTagFree
 
   when(io.descriptor.valid) {
     assert(descriptorTagInRange,
-      "VPU load merger descriptor tag is outside the architectural table")
+      "VPU load merger descriptor tag is outside the load-tag table")
     assert(io.descriptor.bits.elementCount <= p.vLen.U,
       "VPU load merger descriptor exceeds VLEN")
   }
@@ -145,7 +152,7 @@ class VpuLoadLineMerger(
   val entryExpected = Reg(Vec(entriesCount, Vec(p.nLanes, Bool())))
 
   val inputTag = io.in.bits.commandTag
-  val inputTagInRange = inputTag < p.hazardEntries.U
+  val inputTagInRange = inputTag < commandTagCapacity.U
   val inputTagActive = inputTagInRange && descriptorActive(inputTag)
   val inputAddress = io.in.bits.spadElement
   val inputAlignedAddress =
@@ -211,7 +218,7 @@ class VpuLoadLineMerger(
 
   when(io.in.valid) {
     assert(inputTagInRange,
-      "VPU load merger input tag is outside the architectural table")
+      "VPU load merger input tag is outside the load-tag table")
     assert(inputTagActive,
       "VPU load merger received data without a live descriptor")
   }

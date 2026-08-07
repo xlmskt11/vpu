@@ -132,10 +132,10 @@ class VpuSfuSchedulerTester(c: VpuCore, p: VpuParams)
 
   // Four SRAM words deliberately make the old word-at-a-time scheduler fail:
   // it inserted a complete result/write/read drain at each 16-element word
-  // boundary.  EXP's five-cycle and reciprocal's thirteen-cycle pipelines
+  // boundary. EXP's eight-cycle and reciprocal's thirteen-cycle pipelines
   // must instead remain full across all three word boundaries.
   runVectorSfu(VpuOpcode.V_EXP_V, destinationGp = 1,
-    expectedLatency = 5, responseRd = 3)
+    expectedLatency = VpuExpApprox.Latency, responseRd = 3)
   runVectorSfu(VpuOpcode.V_RECI_V, destinationGp = 2,
     expectedLatency = p.reciprocalLatency, responseRd = 4)
 }

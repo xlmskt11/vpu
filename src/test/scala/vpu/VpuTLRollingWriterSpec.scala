@@ -440,8 +440,8 @@ private class VpuTLRollingWriterTester(
   val secondHost = BigInt(0x5000)
   val firstSpad = 0
   val secondSpad = p.vLen
-  val firstTag = 3
-  val secondTag = 5
+  val firstTag = 0
+  val secondTag = 1
 
   // Descriptor admission is independent of prior payload and D lifetimes.
   issueDescriptor(firstHost, firstSpad, firstTag)
@@ -553,8 +553,8 @@ private class VpuTLRollingWriterTester(
   // ordered terminal completion.
   val faultHost = BigInt(0x6000)
   val faultYoungerHost = BigInt(0x7000)
-  val faultTag = 7
-  val faultYoungerTag = 9
+  val faultTag = 2
+  val faultYoungerTag = 3
   issueDescriptor(faultHost, firstSpad, faultTag)
   issueDescriptor(faultYoungerHost, secondSpad, faultYoungerTag)
   for (beat <- 0 until beatsPerCommand) {
