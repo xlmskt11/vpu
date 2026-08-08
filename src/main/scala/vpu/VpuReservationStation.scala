@@ -291,8 +291,9 @@ class VpuReservationStation(p: VpuParams) extends Module {
       val base = local.base.pad(rangeWidth)
       val count = local.elementCount.pad(rangeWidth)
       val endElement = base +& count
-      val startRow = base / p.nLanes.U
-      val endRow = (endElement + (p.nLanes - 1).U) / p.nLanes.U
+      val startRow = base / p.matrixElementsPerRow.U
+      val endRow = (endElement + (p.matrixElementsPerRow - 1).U) /
+        p.matrixElementsPerRow.U
       val shared = io.vsramDeps.get.allocate.bits.accesses(accessIndex)
 
       shared.valid := local.elementCount =/= 0.U &&
@@ -306,7 +307,7 @@ class VpuReservationStation(p: VpuParams) extends Module {
       when (io.vsramDeps.get.allocate.valid && shared.valid) {
         assert(endElement <= p.totalElements.U,
           "VPU shared dependency range escaped VSRAM")
-        assert(endRow <= p.totalWords.U,
+        assert(endRow <= p.matrixRows.U,
           "VPU shared dependency matrix-row range escaped VSRAM")
       }
     }

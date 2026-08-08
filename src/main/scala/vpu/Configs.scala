@@ -66,14 +66,17 @@ class WithVpu(params: VpuParams = VpuConfigs.default)
 
 class WithBf16StorageVpu extends WithVpu(VpuConfigs.bf16Storage)
 
-/** A single coherent 4x16 Gemmini + VPU cluster.
+/** One coherent Gemmini + VPU cluster with one to four Gemmini endpoints.
   *
-  * The fifth BuildRoCC entry is deliberately the VPU so Gemmini broadcast
-  * indices remain 0..3.  All cross-accelerator wires are created only after
-  * those five LazyModules exist, inside the VPU factory's InModuleBody.
-  * Gemmini0--3 and the VPU retain their original RoCC command paths: VPU
-  * funct 64 is an exact custom0 route, Gemmini0 is the wildcard custom0
-  * fallback, and Gemmini1--3 retain custom1--3.
+  * Gemmini endpoints retain broadcast indices 0..nGemminis-1. The VPU is the
+  * final BuildRoCC entry, with funct 64 as an exact custom0 route; Gemmini0 is
+  * the wildcard custom0 fallback and additional Gemminis use custom1--3.
+  *
+  * A multi-Gemmini cluster externalizes SPAD/ACC and their dependency table so
+  * the members can share them. A physically single-Gemmini cluster keeps its
+  * ordinary local SPAD/ACC and local reservation dependencies; only the VSRAM
+  * bridge, VSRAM dependency side table, and fusion group controller are shared
+  * with the VPU.
   */
 class WithGemminiVpuFusion(
     gemminiBase: GemminiArrayConfig[Float, Float, Float] =
@@ -88,21 +91,31 @@ class WithGemminiVpuFusion(
       vSpadBanks = 8,
       vSpadSubBanks = 4,
       matrixPorts = 4,
+      matrixRowElements = 16,
       enableSharedDeps = true,
-      enableGroupedCommands = true))
+      enableGroupedCommands = true),
+    nGemminis: Int = 4)
     extends Config((site, here, up) => {
   case BuildRoCC => {
-    val gemminis = Array.ofDim[Gemmini[Float, Float, Float]](4)
+    require(nGemminis >= 1 && nGemminis <= 4,
+      "Gemmini/VPU fusion supports one to four RoCC Gemmini endpoints")
+
+    val shareGemminiMem = nGemminis > 1
+    val gemminis = Array.ofDim[Gemmini[Float, Float, Float]](nGemminis)
     var fusedVpu: VpuRoCC = null
 
     def gemminiFactory(index: Int) = (p: Parameters) => {
       implicit val q: Parameters = p
       implicit val valName: ValName = ValName(s"gemmini$index")
-      val opcode = index match {
-        case 0 => OpcodeSet.custom0
-        case 1 => OpcodeSet.custom1
-        case 2 => OpcodeSet.custom2
-        case 3 => OpcodeSet.custom3
+      val opcode = if (nGemminis == 1) {
+        OpcodeSet.custom3
+      } else {
+        index match {
+          case 0 => OpcodeSet.custom0
+          case 1 => OpcodeSet.custom1
+          case 2 => OpcodeSet.custom2
+          case 3 => OpcodeSet.custom3
+        }
       }
       val header = index match {
         case 0 => "gemmini_params.h"
@@ -113,9 +126,9 @@ class WithGemminiVpuFusion(
       gemminis(index) = LazyModule(new Gemmini(gemminiBase.copy(
         opcodes = opcode,
         headerFileName = header,
-        nSharers = 4,
-        use_shared_ext_mem = true,
-        use_shared_res_entries = true,
+        nSharers = nGemminis,
+        use_shared_ext_mem = shareGemminiMem,
+        use_shared_res_entries = shareGemminiMem,
         use_vpu_fusion = true),
         commandRoute = RoCCCommandRoute(broadcastIndex = Some(index))))
       gemminis(index)
@@ -129,13 +142,13 @@ class WithGemminiVpuFusion(
       InModuleBody {
         val g0 = gemminis(0)
         require(gemminis.forall(_ != null),
-          "all four Gemminis must be constructed before fusion wiring")
-        require(vpuBase.matrixPorts == 4 &&
+          "all Gemminis must be constructed before fusion wiring")
+        require(vpuBase.matrixPorts == nGemminis &&
           vpuBase.enableGroupedCommands && vpuBase.enableSharedDeps)
-        require(vpuBase.nLanes == g0.config.meshColumns *
+        require(vpuBase.matrixElementsPerRow == g0.config.meshColumns *
           g0.config.tileColumns)
         require(vpuBase.storageBits == g0.config.accType.getWidth)
-        require(vpuBase.totalWords ==
+        require(vpuBase.matrixRows ==
           g0.config.acc_banks * g0.config.acc_bank_entries,
           "VSRAM and shared ACC must expose the same global row range")
         require(vpuBase.vSpadBanks >= vpuBase.matrixPorts,
@@ -153,26 +166,40 @@ class WithGemminiVpuFusion(
             g.config.acc_bank_entries == g0.config.acc_bank_entries)
         }
 
-        val sharedMem = Module(new SharedExtMem_4(g0.config))
-        for (index <- 0 until 4) {
-          sharedMem.io.in(index) <> gemminis(index).module.ext_mem_io.get
+        val sharedMem = if (shareGemminiMem) {
+          Some(Module(new SharedExtMem_4(g0.config)))
+        } else {
+          None
+        }
+        for (index <- 0 until nGemminis) {
+          sharedMem.foreach { mem =>
+            mem.io.in(index) <> gemminis(index).module.ext_mem_io.get
+          }
           fusedVpu.module.matrixRead.get(index) <>
             gemminis(index).module.vpu_matrix_read_io.get
-          fusedVpu.module.matrixWrite.get(index) <>
-            sharedMem.io.vpuWrite.get(index)
+          if (shareGemminiMem) {
+            fusedVpu.module.matrixWrite.get(index) <>
+              sharedMem.get.io.vpuWrite.get(index)
+          } else {
+            fusedVpu.module.matrixWrite.get(index) <>
+              gemminis(index).module.vpu_matrix_write_io.get
+          }
         }
 
-        // Preserve Gemmini's original SPAD/ACC dependency tracker.
-        val spadAccDeps = Module(new SharedExtEntries(
-          g0.config.nSharers,
-          g0.config.local_addr_t,
-          g0.config.reservation_station_entries_ld,
-          g0.config.reservation_station_entries_ex,
-          g0.config.reservation_station_entries_st,
-          g0.config.res_max_per_type))
-        for (index <- 0 until 4) {
-          spadAccDeps.io.in(index) <>
-            gemminis(index).module.ext_deps_io.get
+        // Multi-Gemmini builds preserve the shared SPAD/ACC dependency table.
+        // One Gemmini uses its ordinary local reservation dependencies.
+        if (shareGemminiMem) {
+          val spadAccDeps = Module(new SharedExtEntries(
+            g0.config.nSharers,
+            g0.config.local_addr_t,
+            g0.config.reservation_station_entries_ld,
+            g0.config.reservation_station_entries_ex,
+            g0.config.reservation_station_entries_st,
+            g0.config.res_max_per_type))
+          for (index <- 0 until nGemminis) {
+            spadAccDeps.io.in(index) <>
+              gemminis(index).module.ext_deps_io.get
+          }
         }
 
         // Only cross-accelerator VSRAM hazards need the fusion side table.
@@ -184,16 +211,16 @@ class WithGemminiVpuFusion(
           g0.config.reservation_station_entries_st,
           g0.config.res_max_per_type,
           vpuEntries = VpuReservationStation.totalEntries(vpuBase)))
-        for (index <- 0 until 4) {
+        for (index <- 0 until nGemminis) {
           vsramDeps.io.in(index) <>
             gemminis(index).module.vsram_deps_io.get
         }
         vsramDeps.io.vpu <> fusedVpu.module.vsramDeps.get
 
         val groupControl = Module(new LdBCompleteControl(
-          nSharers = 4,
+          nSharers = nGemminis,
           useVpuFusion = g0.config.use_vpu_fusion))
-        for (index <- 0 until 4) {
+        for (index <- 0 until nGemminis) {
           groupControl.io.in(index) <>
             gemminis(index).module.ext_loop_ws_io.get
         }
@@ -216,15 +243,43 @@ class WithGemminiVpuFusion(
         // interface. Fusion does not alter it, so preserve the legacy four-way
         // completion controller even though this inference config disables
         // training convolutions.
-        val inputGroupControl = Module(new LdICompleteControl(4))
-        for (index <- 0 until 4) {
-          inputGroupControl.io.in(index) <>
-            gemminis(index).module.ext_loop_conv_ws_io.get
+        if (shareGemminiMem) {
+          val inputGroupControl = Module(new LdICompleteControl(nGemminis))
+          for (index <- 0 until nGemminis) {
+            inputGroupControl.io.in(index) <>
+              gemminis(index).module.ext_loop_conv_ws_io.get
+          }
         }
       }
       fusedVpu
     }
 
-    up(BuildRoCC) ++ (0 until 4).map(gemminiFactory) :+ vpuFactory
+    up(BuildRoCC) ++ (0 until nGemminis).map(gemminiFactory) :+ vpuFactory
   }
 })
+
+/** One physical 32x32 BF16-input/FP32-accumulate Gemmini fused to one FP32
+  * VPU. Unlike the four-Gemmini configuration, Gemmini keeps local SPAD/ACC
+  * storage and its local reservation dependencies.
+  */
+class WithSingle32x32GemminiVpuFusion extends WithGemminiVpuFusion(
+  gemminiBase = FusionGemminiConfig.base.copy(
+    meshRows = 32,
+    meshColumns = 32,
+    sp_capacity = CapacityInKilobytes(256),
+    acc_capacity = CapacityInKilobytes(256),
+    max_in_flight_mem_reqs = 32),
+  vpuBase = VpuParams(
+    storageType = VpuStorageType.FP32,
+    computeType = VpuStorageType.FP32,
+    vLen = 128,
+    nLanes = 16,
+    sfuLanes = 4,
+    vSpadKB = 256,
+    vSpadBanks = 8,
+    vSpadSubBanks = 4,
+    matrixPorts = 1,
+    matrixRowElements = 32,
+    enableSharedDeps = true,
+    enableGroupedCommands = true),
+  nGemminis = 1)

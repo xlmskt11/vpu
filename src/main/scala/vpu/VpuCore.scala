@@ -38,6 +38,10 @@ class VpuExecuteQueueEntry(p: VpuParams) extends Bundle {
   val source0 = UInt(p.elementAddrBits.W)
   val source1 = UInt(p.elementAddrBits.W)
   val elementCount = UInt(p.vlBits.W)
+  // Zero keeps the original contiguous vector layout. A nonzero value is the
+  // start-to-start element stride between matrixElementsPerRow-sized segments
+  // of this logical vector and is snapshotted at RS allocation.
+  val vectorStride = UInt(p.elementAddrBits.W)
   val useSource1 = Bool()
   // rs3=1 selects a dispatch-time mask version. The protected mask file keeps
   // that version immutable while this compact slot ID remains live in the RS.
@@ -207,10 +211,12 @@ class VpuCore(p: VpuParams) extends Module {
     val fusionFault = if (p.enableGroupedCommands) Some(Input(Bool())) else None
     val matrixRead = if (p.matrixPorts > 0) Some(Vec(p.matrixPorts,
       Flipped(new GemminiVpuMatrixReadIO(
-        p.matrixRowAddrBits, p.nLanes, p.storageBits)))) else None
+        p.matrixRowAddrBits, p.matrixElementsPerRow,
+        p.storageBits)))) else None
     val matrixWrite = if (p.matrixPorts > 0) Some(Flipped(Vec(p.matrixPorts,
       Valid(new GemminiVpuMatrixWriteReq(
-        p.matrixRowAddrBits, p.nLanes, p.storageBits))))) else None
+        p.matrixRowAddrBits, p.matrixElementsPerRow,
+        p.storageBits))))) else None
     val vsramDeps = if (p.enableSharedDeps) Some(new VsramClientIO(
       p.sharedHazardAddressBits,
       VpuReservationStation.totalEntries(p))) else None
@@ -242,6 +248,7 @@ class VpuCore(p: VpuParams) extends Module {
   val fp = RegInit(VecInit(Seq.fill(8)(0.U(32.W))))
   val h = RegInit(VecInit(Seq.fill(16)(0.U(64.W))))
   val currentVl = RegInit(p.vLen.U(p.vlBits.W))
+  val currentVectorStrideElements = RegInit(0.U(p.elementAddrBits.W))
   val currentDmaStrideBytes = RegInit(0.U(64.W))
   val stickyFflags = RegInit(0.U(5.W))
   val illegalCommand = RegInit(false.B)
@@ -834,6 +841,21 @@ class VpuCore(p: VpuParams) extends Module {
   def isBaseVectorAlu(opcode: UInt): Bool = isVectorOpcode(opcode) &&
     !isReduction(opcode) && !isSfuVector(opcode) && !isRearrange(opcode)
 
+  /** Map a logical vector offset onto the existing tile-major VSRAM layout.
+    * Tags and all arithmetic sequencing remain logical; only SRAM addresses
+    * jump between matrix-row segments when vectorStride is nonzero.
+    */
+  def vectorAddress(base: UInt, logicalOffset: UInt,
+                    vectorStride: UInt): UInt = {
+    val segment = logicalOffset / p.matrixElementsPerRow.U
+    val withinSegment = logicalOffset % p.matrixElementsPerRow.U
+    val physicalOffset = Mux(vectorStride === 0.U, logicalOffset,
+      segment * vectorStride + withinSegment)
+    val address = Wire(UInt(p.elementAddrBits.W))
+    address := base + physicalOffset
+    address
+  }
+
   val executeCanStart = executeState === exIdle && !faultActive &&
     (!isRearrange(reservationStation.io.issue.execute.bits.command.opcode) ||
       rearrange.io.start.ready)
@@ -937,11 +959,12 @@ class VpuCore(p: VpuParams) extends Module {
     activeExecute.useSource1 && !sourceOperandsAlias &&
     aluSource1ReadsRemaining
   val regularSource0Read = Wire(new VpuSpadReadRequest(p))
-  regularSource0Read.address := activeExecute.source0 + source0RequestedOffset
+  regularSource0Read.address := vectorAddress(activeExecute.source0,
+    source0RequestedOffset, activeExecute.vectorStride)
   regularSource0Read.tag := source0RequestedOffset.pad(p.spadReadTagBits)
   val regularSource1Read = Wire(new VpuSpadReadRequest(p))
-  regularSource1Read.address :=
-    activeExecute.source1 + aluSource1ReadOffset
+  regularSource1Read.address := vectorAddress(activeExecute.source1,
+    aluSource1ReadOffset, activeExecute.vectorStride)
   regularSource1Read.tag :=
     aluSource1ReadOffset.pad(p.spadReadTagBits)
 
@@ -1045,7 +1068,8 @@ class VpuCore(p: VpuParams) extends Module {
   vectorFmaFabric.io.aluIn.bits.operation := vectorAluOperation
   vectorFmaFabric.io.aluIn.bits.laneMask := aluResponseMask
   vectorFmaFabric.io.aluIn.bits.destination :=
-    activeExecute.destination + aluResponseOffset
+    vectorAddress(activeExecute.destination, aluResponseOffset,
+      activeExecute.vectorStride)
   vectorFmaFabric.io.aluIn.bits.last := aluResponseOffset + p.nLanes.U >=
     activeExecute.elementCount
   for (lane <- 0 until p.nLanes) {
@@ -1251,7 +1275,8 @@ class VpuCore(p: VpuParams) extends Module {
   sfuWritebackQueue.io.enq.valid := collectingVectorSfu &&
     sfuResultChunkLast
   sfuWritebackQueue.io.enq.bits.address :=
-    activeExecute.destination + sfuResultOffset
+    vectorAddress(activeExecute.destination, sfuResultOffset,
+      activeExecute.vectorStride)
   sfuWritebackQueue.io.enq.bits.data := sfuAssembledWord
   sfuWritebackQueue.io.enq.bits.laneMask := sfuResultLaneMask
   sfuWritebackQueue.io.enq.bits.last := sfuResultWordLast
@@ -1465,6 +1490,8 @@ class VpuCore(p: VpuParams) extends Module {
   val frontIsRead = frontOpcode === VpuOpcode.C_READ.U
   val frontIsClear = frontOpcode === VpuOpcode.C_CLEAR_STATUS.U
   val frontMaskWrite = frontOpcode === VpuOpcode.C_WRITE_VMASK.U
+  val frontSetVectorStride =
+    frontOpcode === VpuOpcode.C_SET_VSTRIDE.U
   val frontIntegerAddi = frontOpcode === VpuOpcode.S_ADDI_INT.U
   val frontLoopControl = VpuDecode.isLoop(frontOpcode)
   val frontNeedsResponse = frontIsFence || frontIsRead || front.xd
@@ -1474,6 +1501,23 @@ class VpuCore(p: VpuParams) extends Module {
   val frontGpRs2 = gp(decoded.rs2)
   val frontGpRs3 = gp(decoded.rs3)
   val frontVl32 = currentVl.pad(32)
+  val frontVectorSegmented = currentVectorStrideElements =/= 0.U
+  val frontVectorLastLogical = Mux(currentVl === 0.U, 0.U,
+    currentVl - 1.U)
+  val frontVectorLastSegment =
+    frontVectorLastLogical / p.matrixElementsPerRow.U
+  val frontVectorLastWithinSegment =
+    frontVectorLastLogical % p.matrixElementsPerRow.U
+  // This half-open bounding interval covers every sparse segment and lets the
+  // existing RS/shared-dependency comparators conservatively protect the
+  // tile-major footprint without a second dependency mechanism.
+  val frontVectorFootprintWide = Mux(currentVl === 0.U, 0.U,
+    Mux(frontVectorSegmented,
+      frontVectorLastSegment * currentVectorStrideElements +
+        frontVectorLastWithinSegment + 1.U,
+      frontVl32))
+  val frontVectorFootprint =
+    frontVectorFootprintWide(p.dmaTransferElementsBits - 1, 0)
   // Keep address arithmetic wider than the architectural 64-bit VA.  A
   // wrapped H + GP byte offset must be rejected rather than silently issuing
   // a descriptor at the low wrapped address.
@@ -1529,9 +1573,18 @@ class VpuCore(p: VpuParams) extends Module {
   val frontSpadRangesValid = Mux(frontLoad || frontStore,
     rangeValid(frontGpRd, frontMemoryFootprint),
     Mux(frontVector,
-      rangeValid(frontGpRs1, frontVl32) &&
-        (!frontVv || rangeValid(frontGpRs2, frontVl32)) &&
-        (!frontHasVectorDestination || rangeValid(frontGpRd, frontVl32)),
+      rangeValid(frontGpRs1, frontVectorFootprintWide) &&
+        (!frontVv ||
+          rangeValid(frontGpRs2, frontVectorFootprintWide)) &&
+        (!frontHasVectorDestination ||
+          rangeValid(frontGpRd, frontVectorFootprintWide)) &&
+        (!frontVectorSegmented ||
+          (!frontRearrange &&
+            frontGpRs1 % p.matrixElementsPerRow.U === 0.U &&
+            (!frontVv ||
+              frontGpRs2 % p.matrixElementsPerRow.U === 0.U) &&
+            (!frontHasVectorDestination ||
+              frontGpRd % p.matrixElementsPerRow.U === 0.U))),
       true.B))
   // Arbitrary gather cannot safely overwrite a source/index vector without
   // buffering the complete vector. Slide has a direction-aware traversal and
@@ -1594,6 +1647,11 @@ class VpuCore(p: VpuParams) extends Module {
       decoded.rd < p.vectorMaskChunks.U)
   val controlFieldsValid = Mux(frontIntegerAddi,
     front.payload === 0.U, ordinaryControlFieldsValid)
+  val setVectorStrideValid = !frontSetVectorStride ||
+    (front.payload < p.elementsPerBank.U &&
+      (front.payload === 0.U ||
+        (front.payload >= p.matrixElementsPerRow.U &&
+          front.payload % p.matrixElementsPerRow.U === 0.U)))
   val setVlValid = frontOpcode =/= VpuOpcode.C_SET_VL.U ||
     front.payload <= p.vLen.U
   val waitPayloadValid = !frontIsWait || front.payload(63, 3) === 0.U
@@ -1609,7 +1667,8 @@ class VpuCore(p: VpuParams) extends Module {
     (frontVector && !vectorFieldsValid) ||
     ((frontLoad || frontStore) && !memoryFieldsValid) ||
     (frontControl && !controlFieldsValid) ||
-    !xdValid || !setVlValid || !waitPayloadValid || !clearPayloadValid
+    !xdValid || !setVectorStrideValid || !setVlValid ||
+    !waitPayloadValid || !clearPayloadValid
 
   val perf = RegInit(VecInit(Seq.fill(VpuPerfIndex.Count)(0.U(64.W))))
   io.perfCounters := perf
@@ -1715,16 +1774,16 @@ class VpuCore(p: VpuParams) extends Module {
     frontAccessSet.accesses(0).read := true.B
   }.elsewhen (frontVector) {
     frontAccessSet.accesses(0).base := frontGpRs1
-    frontAccessSet.accesses(0).elementCount := currentVl
+    frontAccessSet.accesses(0).elementCount := frontVectorFootprint
     frontAccessSet.accesses(0).read := true.B
     when (frontVv) {
       frontAccessSet.accesses(1).base := frontGpRs2
-      frontAccessSet.accesses(1).elementCount := currentVl
+      frontAccessSet.accesses(1).elementCount := frontVectorFootprint
       frontAccessSet.accesses(1).read := true.B
     }
     when (frontHasVectorDestination) {
       frontAccessSet.accesses(2).base := frontGpRd
-      frontAccessSet.accesses(2).elementCount := currentVl
+      frontAccessSet.accesses(2).elementCount := frontVectorFootprint
       frontAccessSet.accesses(2).write := true.B
     }
   }
@@ -1764,6 +1823,8 @@ class VpuCore(p: VpuParams) extends Module {
   reservationStation.io.allocate.execute.bits.command.source0 := frontGpRs1
   reservationStation.io.allocate.execute.bits.command.source1 := frontGpRs2
   reservationStation.io.allocate.execute.bits.command.elementCount := currentVl
+  reservationStation.io.allocate.execute.bits.command.vectorStride :=
+    currentVectorStrideElements
   reservationStation.io.allocate.execute.bits.command.useSource1 := frontVv
   reservationStation.io.allocate.execute.bits.command.maskEnable :=
     decoded.rs3 === 1.U
@@ -1849,6 +1910,10 @@ class VpuCore(p: VpuParams) extends Module {
         fp(decoded.rd(2, 0)) := front.payload(31, 0)
       }
       is (VpuOpcode.C_WRITE_H.U) { h(decoded.rd) := front.payload }
+      is (VpuOpcode.C_SET_VSTRIDE.U) {
+        currentVectorStrideElements :=
+          front.payload(p.elementAddrBits - 1, 0)
+      }
       is (VpuOpcode.C_SET_STRIDE.U) {
         currentDmaStrideBytes := front.payload
       }

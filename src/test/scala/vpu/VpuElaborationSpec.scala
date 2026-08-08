@@ -45,6 +45,27 @@ class VpuElaborationSpec extends AnyFlatSpec {
     assertThrows[IllegalArgumentException](VpuParams(fmaPipeDepth = 3))
     assertThrows[IllegalArgumentException](VpuParams(loopBufferEntries = 3))
     assertThrows[IllegalArgumentException](VpuParams(loopStackDepth = 3))
+    assertThrows[IllegalArgumentException](VpuParams(
+      matrixPorts = 1, matrixRowElements = 24))
+    assertThrows[IllegalArgumentException](VpuParams(
+      matrixPorts = 1, matrixRowElements = 80, vSpadSubBanks = 4))
+  }
+
+  it should "keep 16-lane SRAM words behind a 32-element matrix port" in {
+    val p = VpuParams(
+      nLanes = 16,
+      vSpadKB = 128,
+      vSpadSubBanks = 4,
+      matrixPorts = 1,
+      matrixRowElements = 32,
+      enableSharedDeps = true,
+      enableGroupedCommands = true)
+    assert(p.wordBits == 512)
+    assert(p.matrixElementsPerRow == 32)
+    assert(p.matrixWordsPerRow == 2)
+    assert(p.matrixRows == p.totalWords / 2)
+    val chirrtl = (new ChiselStage).emitChirrtl(new VpuCore(p))
+    assert(chirrtl.contains("module VpuBankedScratchpad"))
   }
 
   it should "generate exact FP32 and BF16 software parameter headers" in {
@@ -90,6 +111,8 @@ class VpuElaborationSpec extends AnyFlatSpec {
     assert(fusionHeader.contains("#define VPU_VSPAD_KIB 128u"))
     assert(fusionHeader.contains("#define VPU_VSPAD_SUBBANKS 4u"))
     assert(fusionHeader.contains("#define VPU_MATRIX_PORTS 4u"))
+    assert(fusionHeader.contains("#define VPU_MATRIX_ROW_ELEMENTS 16u"))
+    assert(fusionHeader.contains("#define VPU_MATRIX_WORDS_PER_ROW 1u"))
     assert(fusionHeader.contains("#define VPU_SHARED_DEPS 1u"))
     assert(fusionHeader.contains("#define VPU_GROUPED_COMMANDS 1u"))
     assert(fusion.headerFilePath == VpuConfigs.default.headerFilePath)

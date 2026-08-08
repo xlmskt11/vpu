@@ -46,10 +46,12 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
       Flipped(Decoupled(new VpuSpadWriteRequest(p))))
     val matrixRead = if (p.matrixPorts > 0) Some(Vec(p.matrixPorts,
       Flipped(new GemminiVpuMatrixReadIO(
-        p.matrixRowAddrBits, p.nLanes, p.storageBits)))) else None
+        p.matrixRowAddrBits, p.matrixElementsPerRow,
+        p.storageBits)))) else None
     val matrixWrite = if (p.matrixPorts > 0) Some(Flipped(Vec(p.matrixPorts,
       Valid(new GemminiVpuMatrixWriteReq(
-        p.matrixRowAddrBits, p.nLanes, p.storageBits))))) else None
+        p.matrixRowAddrBits, p.matrixElementsPerRow,
+        p.storageBits))))) else None
     val busy = Output(Bool())
     // One pulse when otherwise-ready clients contend for the same bank and
     // one must wait for the bank-local round-robin grant.
@@ -73,7 +75,7 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
   private def row(address: UInt): UInt =
     wordInBank(address) / p.vSpadSubBanks.U
   private def matrixElementAddress(matrixRow: UInt): UInt =
-    matrixRow * p.nLanes.U
+    matrixRow * p.matrixElementsPerRow.U
   private def isWordAligned(address: UInt): Bool =
     (address % p.nLanes.U) === 0.U
 
@@ -88,7 +90,7 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
   private val matrixResponseDepth = 2
   private val matrixResponseQueues = Seq.fill(p.matrixPorts) {
     Module(new Queue(new GemminiVpuMatrixReadResp(
-      p.nLanes, p.storageBits), matrixResponseDepth,
+      p.matrixElementsPerRow, p.storageBits), matrixResponseDepth,
       pipe = false, flow = false))
   }
   private val matrixReservedWidth =
@@ -112,12 +114,24 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     bank(io.readRequest(client).bits.address)
   }
 
+  private val matrixFragments = for {
+    port <- 0 until p.matrixPorts
+    fragment <- 0 until p.matrixWordsPerRow
+  } yield (port, fragment)
   private val matrixAddresses = (0 until p.matrixPorts).map { port =>
-    matrixElementAddress(io.matrixRead.get(port).req.bits.rowAddress)
+    (0 until p.matrixWordsPerRow).map { fragment =>
+      matrixElementAddress(io.matrixRead.get(port).req.bits.rowAddress) +
+        (fragment * p.nLanes).U
+    }
   }
-  private val matrixBanks = matrixAddresses.map(bank)
-  private val matrixLogicalBanks = matrixAddresses.map(logicalBank)
-  private val matrixRows = matrixAddresses.map(row)
+  private val matrixBanks = matrixAddresses.map(_.map(bank))
+  private val matrixLogicalBanks = matrixAddresses.map(_.map(logicalBank))
+  private val matrixRows = matrixAddresses.map(_.map(row))
+  private val matrixBankMasks = matrixBanks.map { fragments =>
+    fragments.map { selectedBank =>
+      UIntToOH(selectedBank, p.physicalBanks)
+    }.reduce(_ | _)
+  }
   private val matrixCredit = (0 until p.matrixPorts).map { port =>
     matrixReservedResponses(port) < matrixResponseDepth.U ||
       io.matrixRead.get(port).resp.fire
@@ -132,13 +146,14 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
   for (lhs <- 0 until p.matrixPorts; rhs <- lhs + 1 until p.matrixPorts) {
     assert(!(io.matrixRead.get(lhs).req.valid &&
       io.matrixRead.get(rhs).req.valid &&
-      matrixLogicalBanks(lhs) === matrixLogicalBanks(rhs)),
+      matrixLogicalBanks(lhs).head === matrixLogicalBanks(rhs).head),
       "two Gemminis requested the same logical VSRAM read bank")
   }
 
   for (port <- 0 until p.matrixPorts) {
     val earlierSamePhysical = (0 until port).map { earlier =>
-      matrixContender(earlier) && matrixBanks(earlier) === matrixBanks(port)
+      matrixContender(earlier) &&
+        (matrixBankMasks(earlier) & matrixBankMasks(port)).orR
     }.reduceOption(_ || _).getOrElse(false.B)
     io.matrixRead.get(port).req.ready := matrixCredit(port) &&
       !earlierSamePhysical
@@ -148,8 +163,8 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     io.matrixRead.get(port).req.fire
   }
   private val matrixClaimedBankMask = if (p.matrixPorts > 0) {
-    matrixContender.zip(matrixBanks).map { case (valid, selectedBank) =>
-      Mux(valid, UIntToOH(selectedBank, p.physicalBanks),
+    matrixContender.zip(matrixBankMasks).map { case (valid, selectedBanks) =>
+      Mux(valid, selectedBanks,
         0.U(p.physicalBanks.W))
     }.reduce(_ | _)
   } else {
@@ -219,7 +234,8 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
   private val readRows = Wire(Vec(p.physicalBanks, UInt(p.subBankRowBits.W)))
   private val readOutputs = Wire(Vec(p.physicalBanks,
     Vec(p.nLanes, UInt(p.storageBits.W))))
-  private val savedMatrixBank = Seq.fill(p.matrixPorts) {
+  private val savedMatrixBank = Seq.fill(
+      p.matrixPorts, p.matrixWordsPerRow) {
     Reg(UInt(p.physicalBankBits.W))
   }
   private val readClientBits = math.max(1, log2Ceil(NumReadClients))
@@ -231,15 +247,17 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
   }
 
   for (b <- 0 until p.physicalBanks) {
-    val matrixHits = (0 until p.matrixPorts).map { port =>
-      acceptingMatrixRead(port) && matrixBanks(port) === b.U
+    val matrixHits = matrixFragments.map { case (port, fragment) =>
+      acceptingMatrixRead(port) && matrixBanks(port)(fragment) === b.U
     }
     val accesses = matrixHits :+ localReadFire(b)
     assert(PopCount(VecInit(accesses)) <= 1.U,
       "a VSRAM bank received more than one read in a cycle")
 
     readEnables(b) := accesses.reduce(_ || _)
-    val matrixRowsForBank = matrixHits.zip(matrixRows)
+    val matrixRowsForBank = matrixHits.zip(matrixFragments.map {
+      case (port, fragment) => matrixRows(port)(fragment)
+    })
     readRows(b) := Mux1H(matrixRowsForBank :+
       (localReadFire(b) -> row(readArbiters(b).io.out.bits.address)))
     readOutputs(b) := memories(b).read(readRows(b), readEnables(b))
@@ -251,8 +269,12 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
   }
 
   private val selectedMatrix = (0 until p.matrixPorts).map { port =>
-    Mux1H((0 until p.physicalBanks).map { b =>
-      (savedMatrixBank(port) === b.U) -> readOutputs(b)
+    VecInit((0 until p.matrixElementsPerRow).map { element =>
+      val fragment = element / p.nLanes
+      val lane = element % p.nLanes
+      Mux1H((0 until p.physicalBanks).map { b =>
+        (savedMatrixBank(port)(fragment) === b.U) -> readOutputs(b)(lane)
+      })
     })
   }
 
@@ -265,9 +287,11 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
       "Gemmini VSRAM matrix response credit accounting overflowed")
 
     when (acceptingMatrixRead(port)) {
-      assert(io.matrixRead.get(port).req.bits.rowAddress < p.totalWords.U,
+      assert(io.matrixRead.get(port).req.bits.rowAddress < p.matrixRows.U,
         "Gemmini VSRAM matrix row is out of range")
-      savedMatrixBank(port) := matrixBanks(port)
+      for (fragment <- 0 until p.matrixWordsPerRow) {
+        savedMatrixBank(port)(fragment) := matrixBanks(port)(fragment)
+      }
     }
 
     val acceptedOnly = acceptingMatrixRead(port) &&
@@ -330,18 +354,28 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     bank(io.writeRequest(client).bits.address)
   }
   private val matrixWriteAddresses = (0 until p.matrixPorts).map { port =>
-    matrixElementAddress(io.matrixWrite.get(port).bits.rowAddress)
+    (0 until p.matrixWordsPerRow).map { fragment =>
+      matrixElementAddress(io.matrixWrite.get(port).bits.rowAddress) +
+        (fragment * p.nLanes).U
+    }
   }
-  private val matrixWriteBanks = matrixWriteAddresses.map(bank)
-  private val matrixWriteLogicalBanks = matrixWriteAddresses.map(logicalBank)
-  private val matrixWriteRows = matrixWriteAddresses.map(row)
+  private val matrixWriteBanks = matrixWriteAddresses.map(_.map(bank))
+  private val matrixWriteLogicalBanks =
+    matrixWriteAddresses.map(_.map(logicalBank))
+  private val matrixWriteRows = matrixWriteAddresses.map(_.map(row))
+  private val matrixWriteBankMasks = matrixWriteBanks.map { fragments =>
+    fragments.map { selectedBank =>
+      UIntToOH(selectedBank, p.physicalBanks)
+    }.reduce(_ | _)
+  }
   private val matrixWriteValid = (0 until p.matrixPorts).map { port =>
     io.matrixWrite.get(port).valid
   }
   private val matrixWriteClaimedBankMask = if (p.matrixPorts > 0) {
-    matrixWriteValid.zip(matrixWriteBanks).map { case (valid, selectedBank) =>
-      Mux(valid, UIntToOH(selectedBank, p.physicalBanks),
-        0.U(p.physicalBanks.W))
+    matrixWriteValid.zip(matrixWriteBankMasks).map {
+      case (valid, selectedBanks) =>
+        Mux(valid, selectedBanks,
+          0.U(p.physicalBanks.W))
     }.reduce(_ | _)
   } else {
     0.U(p.physicalBanks.W)
@@ -349,13 +383,14 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
 
   for (port <- 0 until p.matrixPorts) {
     when (matrixWriteValid(port)) {
-      assert(io.matrixWrite.get(port).bits.rowAddress < p.totalWords.U,
+      assert(io.matrixWrite.get(port).bits.rowAddress < p.matrixRows.U,
         "Gemmini VSRAM matrix write row is out of range")
     }
   }
   for (lhs <- 0 until p.matrixPorts; rhs <- lhs + 1 until p.matrixPorts) {
     assert(!(matrixWriteValid(lhs) && matrixWriteValid(rhs) &&
-      matrixWriteLogicalBanks(lhs) === matrixWriteLogicalBanks(rhs)),
+      matrixWriteLogicalBanks(lhs).head ===
+        matrixWriteLogicalBanks(rhs).head),
       "two Gemminis wrote the same logical VSRAM bank")
   }
 
@@ -400,21 +435,29 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     }
   }
   for (b <- 0 until p.physicalBanks) {
-    val matrixHits = (0 until p.matrixPorts).map { port =>
-      matrixWriteValid(port) && matrixWriteBanks(port) === b.U
+    val matrixHits = matrixFragments.map { case (port, fragment) =>
+      matrixWriteValid(port) && matrixWriteBanks(port)(fragment) === b.U
     }
     val write0 = acceptingWrite(0) && inputWriteBank(0) === b.U
     val write1 = acceptingWrite(1) && inputWriteBank(1) === b.U
     val accesses = matrixHits ++ Seq(write0, write1)
     assert(PopCount(VecInit(accesses)) <= 1.U,
       "a VSRAM physical bank received more than one write in a cycle")
-    val matrixData = matrixHits.zipWithIndex.map { case (hit, port) =>
-      hit -> io.matrixWrite.get(port).bits.data
+    val matrixData = matrixHits.zip(matrixFragments).map {
+      case (hit, (port, fragment)) =>
+        hit -> VecInit((0 until p.nLanes).map { lane =>
+          io.matrixWrite.get(port).bits.data(fragment * p.nLanes + lane)
+        })
     }
-    val matrixMasks = matrixHits.zipWithIndex.map { case (hit, port) =>
-      hit -> io.matrixWrite.get(port).bits.laneMask
+    val matrixMasks = matrixHits.zip(matrixFragments).map {
+      case (hit, (port, fragment)) =>
+        hit -> VecInit((0 until p.nLanes).map { lane =>
+          io.matrixWrite.get(port).bits.laneMask(fragment * p.nLanes + lane)
+        })
     }
-    val matrixRowSelect = matrixHits.zip(matrixWriteRows)
+    val matrixRowSelect = matrixHits.zip(matrixFragments.map {
+      case (port, fragment) => matrixWriteRows(port)(fragment)
+    })
     val selectedData = Mux1H(matrixData ++ Seq(
       write0 -> io.writeRequest(0).bits.data,
       write1 -> io.writeRequest(1).bits.data))

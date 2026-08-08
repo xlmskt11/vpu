@@ -54,6 +54,7 @@ class VpuIsaSpec extends AnyFlatSpec {
     assert(VpuOpcode.C_WRITE_VMASK == 0x2e)
     assert(VpuOpcode.V_GATHER_VV == 0x31)
     assert(VpuOpcode.V_SLIDE_V == 0x32)
+    assert(VpuOpcode.C_SET_VSTRIDE == 0x37)
     assert(VpuOpcode.C_CLEAR_STATUS == 0x3f)
     assert(VpuReadSelector.Perf == 4)
     assert(VpuReadSelector.FaultAddress == 5)

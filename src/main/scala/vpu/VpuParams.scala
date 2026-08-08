@@ -33,6 +33,11 @@ case class VpuParams(
   // Number of Gemmini matrix read/write clients. Zero preserves the closed,
   // standalone VPU interface and elaborates no fusion ports.
   matrixPorts: Int = 0,
+  // Number of elements transferred by one Gemmini matrix-row request. Zero
+  // keeps the legacy one-VPU-word row (nLanes elements). A wider matrix row
+  // is split across matrixWordsPerRow consecutive VSRAM sub-banks while the
+  // VPU datapath and each physical SRAM word remain nLanes wide.
+  matrixRowElements: Int = 0,
   enableSharedDeps: Boolean = false,
   loadQueueEntries: Int = 4,
   execQueueEntries: Int = 8,
@@ -90,14 +95,18 @@ case class VpuParams(
   val dmaReadMergeEntries: Int = math.max(2,
     (dmaMaxInFlight + 1) * dmaMaxWordsPerTransaction)
   val totalWords: Int = totalElements / nLanes
-  // Matrix fusion addresses one complete nLanes-wide VSRAM word.  This is an
-  // address width, unlike sharedHazardAddressBits, whose half-open end must
-  // additionally represent totalWords itself.
-  val matrixRowAddrBits: Int = math.max(1, log2Ceil(totalWords))
-  // Half-open shared dependency intervals must represent totalWords itself
+  val matrixElementsPerRow: Int =
+    if (matrixRowElements == 0) nLanes else matrixRowElements
+  val matrixWordsPerRow: Int = matrixElementsPerRow / nLanes
+  val matrixRows: Int = totalElements / matrixElementsPerRow
+  // Matrix fusion and the cross-accelerator dependency table use Gemmini
+  // matrix rows as their common address unit. Physical VSRAM words remain
+  // nLanes wide and are an implementation detail of the scratchpad bridge.
+  val matrixRowAddrBits: Int = math.max(1, log2Ceil(matrixRows))
+  // Half-open shared dependency intervals must represent matrixRows itself
   // as the exclusive end, hence the +1 in the width calculation.
   val sharedHazardAddressBits: Int =
-    math.max(1, log2Ceil(totalWords + 1))
+    math.max(1, log2Ceil(matrixRows + 1))
   val wordsPerBank: Int = totalWords / vSpadBanks
   val wordsPerSubBank: Int = wordsPerBank / vSpadSubBanks
   val physicalBanks: Int = vSpadBanks * vSpadSubBanks
@@ -163,9 +172,18 @@ case class VpuParams(
     "VSRAM sub-banks must evenly and power-of-two split each logical bank")
   require(matrixPorts >= 0,
     "the number of Gemmini matrix ports cannot be negative")
+  require(matrixElementsPerRow >= nLanes &&
+    matrixElementsPerRow % nLanes == 0,
+    "a Gemmini matrix row must contain an integer number of VPU lane words")
+  require(totalElements % matrixElementsPerRow == 0,
+    "VSRAM must contain an integer number of Gemmini matrix rows")
+  require(wordsPerBank % matrixWordsPerRow == 0,
+    "a Gemmini matrix row must not cross a logical VSRAM bank boundary")
   if (matrixPorts > 0) {
     require(storageType == VpuStorageType.FP32 && storageBits == 32,
       "the v1 Gemmini matrix bridge transports FP32 VSRAM rows")
+    require(matrixWordsPerRow <= vSpadSubBanks,
+      "one matrix row needs a distinct VSRAM sub-bank per lane word")
   }
   require(!enableSharedDeps || enableGroupedCommands,
     "shared Gemmini/VPU dependencies require grouped command transport")
@@ -240,6 +258,8 @@ case class VpuParams(
 #define VPU_VSPAD_BANKS ${vSpadBanks}u
 #define VPU_VSPAD_SUBBANKS ${vSpadSubBanks}u
 #define VPU_MATRIX_PORTS ${matrixPorts}u
+#define VPU_MATRIX_ROW_ELEMENTS ${matrixElementsPerRow}u
+#define VPU_MATRIX_WORDS_PER_ROW ${matrixWordsPerRow}u
 #define VPU_SHARED_DEPS ${if (enableSharedDeps) 1 else 0}u
 #define VPU_DMA_MAX_ROWS ${dmaMaxRows}u
 #define VPU_STORAGE_KIND $storageKind

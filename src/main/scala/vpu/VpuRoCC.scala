@@ -44,11 +44,13 @@ class VpuRoCCModule(outer: VpuRoCC)
 
   val matrixRead = if (outer.vpuParams.matrixPorts > 0) Some(IO(Vec(
     outer.vpuParams.matrixPorts, Flipped(new GemminiVpuMatrixReadIO(
-      outer.vpuParams.matrixRowAddrBits, outer.vpuParams.nLanes,
+      outer.vpuParams.matrixRowAddrBits,
+      outer.vpuParams.matrixElementsPerRow,
       outer.vpuParams.storageBits))))) else None
   val matrixWrite = if (outer.vpuParams.matrixPorts > 0) Some(IO(Flipped(Vec(
     outer.vpuParams.matrixPorts, Valid(new GemminiVpuMatrixWriteReq(
-      outer.vpuParams.matrixRowAddrBits, outer.vpuParams.nLanes,
+      outer.vpuParams.matrixRowAddrBits,
+      outer.vpuParams.matrixElementsPerRow,
       outer.vpuParams.storageBits)))))) else None
   val vsramDeps = if (outer.vpuParams.enableSharedDeps) Some(IO(
     new VsramClientIO(

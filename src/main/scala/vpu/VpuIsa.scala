@@ -35,6 +35,13 @@ object VpuOpcode {
   val H_PREFETCH_V  = 0x29
   val H_STORE_V     = 0x2a
 
+  // Optional start-to-start stride, in VSRAM elements, between consecutive
+  // matrix-row segments of one logical vector command. Zero retains the
+  // original contiguous addressing mode.
+  // 0x2c is PLENA's scale-register opcode. Keep that encoding free even
+  // though v1 has no scale SRAM, and place this local extension at 0x37.
+  val C_SET_VSTRIDE = 0x37
+
   // Keep the public encodings aligned with PLENA where an equivalent
   // operation exists.  The control operations use RoCC rs2/payload directly
   // instead of requiring PLENA's scalar integer register file.
@@ -65,7 +72,7 @@ object VpuOpcode {
     V_EXP_V, V_RECI_V, V_RED_SUM, V_RED_MAX, V_MAX_VF, V_MIN_VF,
     S_ADD_FP, S_SUB_FP, S_MAX_FP, S_MUL_FP, S_EXP_FP, S_RECI_FP,
     S_SQRT_FP, S_LOAD_STATE, S_STORE_STATE, S_ADDI_INT,
-    H_PREFETCH_V, H_STORE_V, C_SET_STRIDE, C_WRITE_VMASK,
+    H_PREFETCH_V, H_STORE_V, C_SET_VSTRIDE, C_SET_STRIDE, C_WRITE_VMASK,
     C_LOOP_START, C_LOOP_END,
     V_GATHER_VV,
     V_SLIDE_V, C_WRITE_GP, C_WRITE_FP,
@@ -212,6 +219,7 @@ object VpuDecode {
       opcode === VpuOpcode.C_LOOP_END.U
   def isControl(opcode: UInt): Bool =
     opcode === VpuOpcode.S_ADDI_INT.U ||
+      opcode === VpuOpcode.C_SET_VSTRIDE.U ||
       opcode === VpuOpcode.C_SET_STRIDE.U ||
       opcode === VpuOpcode.C_WRITE_VMASK.U ||
       opcode >= VpuOpcode.C_WRITE_GP.U
