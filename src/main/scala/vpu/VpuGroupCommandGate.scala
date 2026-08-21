@@ -28,7 +28,14 @@ class VpuGroupCommandGate(groupIdBits: Int) extends Module {
     val commandRejected = Input(Bool())
     val commandClearsFusionFault = Input(Bool())
     val group = new VpuGemvGroupIO(groupIdBits)
+    /** Full grouped-protocol state, including sequences which require a later
+      * group_last command from software.
+      */
     val busy = Output(Bool())
+    /** A command already accepted by Rocket but not yet dispatched.  Unlike
+      * an open group by itself, this state is safe for Rocket FENCE to await.
+      */
+    val fenceBusy = Output(Bool())
     val protocolError = Output(Bool())
     val fusionFault = Output(Bool())
   })
@@ -194,6 +201,10 @@ class VpuGroupCommandGate(groupIdBits: Int) extends Module {
     (selectedIllegal || io.commandRejected || lastMissingAdmission) ||
     drainDropFire || drainForwardFire
   io.busy := heldValid || activeGroupValid || abortDrainValid
+  // activeGroupValid and abortDrainValid require group_last from software and
+  // therefore must not participate in Rocket's FENCE interlock. heldValid is
+  // an already-accepted command whose downstream admission is still pending.
+  io.fenceBusy := heldValid
   io.fusionFault := fusionFault
 
   when(io.group.dispatchEnable) {
@@ -215,6 +226,7 @@ class VpuGroupCommandGate(groupIdBits: Int) extends Module {
   dontTouch(io.group.lastDispatchFire)
   dontTouch(io.group.abort)
   dontTouch(io.protocolError)
+  dontTouch(io.fenceBusy)
   dontTouch(fusionFault)
   dontTouch(abortDrainValid)
 }

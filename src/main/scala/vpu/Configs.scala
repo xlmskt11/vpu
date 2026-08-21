@@ -10,6 +10,11 @@ import gemmini._
 import gemmini.Arithmetic.FloatArithmetic._
 
 private object FusionGemminiConfig {
+  // BF16 doubles the operand bytes relative to the original INT8 datapath.
+  // Match that traffic increase with a 256-bit DMA datapath while retaining
+  // the existing 64-byte cache-line transaction size.
+  val dmaBusWidth = 256
+
   /** BF16 operands enter a WS array while vertical partial sums and the
     * accumulator RMW path remain FP32.  Keep this integration-only preset in
     * the VPU project so ordinary Gemmini configuration sources stay intact.
@@ -21,8 +26,8 @@ private object FusionGemminiConfig {
       accType = Float(8, 24),
       tileRows = 1,
       tileColumns = 1,
-      meshRows = 16,
-      meshColumns = 16,
+      meshRows = 8,
+      meshColumns = 8,
       dataflow = Dataflow.WS,
       tile_latency = 2,
       mesh_output_delay = 1,
@@ -35,6 +40,7 @@ private object FusionGemminiConfig {
       acc_sub_banks = 4,
       acc_singleported = false,
       acc_latency = 4,
+      dma_buswidth = dmaBusWidth,
       max_in_flight_mem_reqs = 16,
       use_shared_ext_mem = true,
       use_shared_res_entries = true,
@@ -85,13 +91,14 @@ class WithGemminiVpuFusion(
       storageType = VpuStorageType.FP32,
       computeType = VpuStorageType.FP32,
       vLen = 128,
-      nLanes = 16,
+      nLanes = 8,
       sfuLanes = 4,
       vSpadKB = 256,
       vSpadBanks = 8,
       vSpadSubBanks = 4,
+      dmaBusWidth = FusionGemminiConfig.dmaBusWidth,
       matrixPorts = 4,
-      matrixRowElements = 16,
+      matrixRowElements = 8,
       enableSharedDeps = true,
       enableGroupedCommands = true),
     nGemminis: Int = 4)
@@ -151,8 +158,23 @@ class WithGemminiVpuFusion(
         require(vpuBase.matrixRows ==
           g0.config.acc_banks * g0.config.acc_bank_entries,
           "VSRAM and shared ACC must expose the same global row range")
-        require(vpuBase.vSpadBanks >= vpuBase.matrixPorts,
-          "each simultaneous Gemmini matrix port needs a VSRAM bank")
+        require(vpuBase.physicalBanks >=
+          vpuBase.matrixPorts * vpuBase.matrixWordsPerRow,
+          "simultaneous Gemmini matrix rows need enough physical VSRAM banks")
+        if (shareGemminiMem) {
+          // SharedExtMem may accept one C_TO_VSRAM row from every distinct
+          // physical ACC bank/sub-bank in the same cycle. Preserve that
+          // distribution in VSRAM: one ACC sub-bank owns a disjoint group of
+          // matrixWordsPerRow physical VSRAM banks, and each logical VSRAM
+          // bank is wholly contained in one ACC bank's global-row range.
+          val physicalBanksPerAccSubBank = vpuBase.matrixWordsPerRow
+          require(vpuBase.vSpadSubBanks %
+            (g0.config.acc_sub_banks * physicalBanksPerAccSubBank) == 0,
+            "multi-Gemmini matrix writes require disjoint VSRAM sub-bank " +
+              "groups for every ACC sub-bank")
+          require(vpuBase.vSpadBanks % g0.config.acc_banks == 0,
+            "VSRAM logical-bank boundaries must subdivide ACC bank ranges")
+        }
         require(vpuBase.sharedHazardAddressBits ==
           g0.config.local_addr_t.data.getWidth,
           "Gemmini and VPU shared dependency address widths differ")
@@ -258,28 +280,30 @@ class WithGemminiVpuFusion(
   }
 })
 
-/** One physical 32x32 BF16-input/FP32-accumulate Gemmini fused to one FP32
+/** One physical 16x16 BF16-input/FP32-accumulate Gemmini fused to one FP32
   * VPU. Unlike the four-Gemmini configuration, Gemmini keeps local SPAD/ACC
   * storage and its local reservation dependencies.
   */
-class WithSingle32x32GemminiVpuFusion extends WithGemminiVpuFusion(
+class WithSingle16x16GemminiVpuFusion extends WithGemminiVpuFusion(
   gemminiBase = FusionGemminiConfig.base.copy(
-    meshRows = 32,
-    meshColumns = 32,
+    meshRows = 16,
+    meshColumns = 16,
     sp_capacity = CapacityInKilobytes(256),
     acc_capacity = CapacityInKilobytes(256),
-    max_in_flight_mem_reqs = 32),
+    n_dma_engines = 4,
+    max_in_flight_mem_reqs = 16),
   vpuBase = VpuParams(
     storageType = VpuStorageType.FP32,
     computeType = VpuStorageType.FP32,
     vLen = 128,
-    nLanes = 16,
+    nLanes = 8,
     sfuLanes = 4,
     vSpadKB = 256,
     vSpadBanks = 8,
-    vSpadSubBanks = 4,
+    vSpadSubBanks = 2,
+    dmaBusWidth = FusionGemminiConfig.dmaBusWidth,
     matrixPorts = 1,
-    matrixRowElements = 32,
+    matrixRowElements = 16,
     enableSharedDeps = true,
     enableGroupedCommands = true),
   nGemminis = 1)

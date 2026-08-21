@@ -221,11 +221,15 @@ private class VpuMatrixScratchpadTester(
   assert(peek(c.io.busy) == 0)
 }
 
-/** An expected-failure test which proves the software bank-allocation
-  * contract is guarded in hardware. */
-private class VpuMatrixLogicalBankCollisionTester(
+/** Exercises the physical-bank arbitration contract of the Gemmini-facing
+  * matrix ports. Requests to one physical bank must rotate fairly, while
+  * requests to distinct sub-banks of one logical bank remain concurrent. */
+private class VpuMatrixRoundRobinTester(
     c: VpuBankedScratchpad,
     p: VpuParams) extends PeekPokeTester(c) {
+  private def pattern(seed: Int): Seq[BigInt] =
+    (0 until p.nLanes).map(lane => BigInt(seed + lane))
+
   for (client <- 0 until VpuBankedScratchpad.NumReadClients) {
     poke(c.io.readRequest(client).valid, 0)
     poke(c.io.readRequest(client).bits.address, 0)
@@ -251,15 +255,121 @@ private class VpuMatrixLogicalBankCollisionTester(
       poke(c.io.matrixWrite.get(port).bits.laneMask(lane), 0)
     }
   }
-  step(1)
+  step(2)
 
-  // Rows zero and one occupy different physical sub-banks but the same
-  // logical bank, which is forbidden for two simultaneous Gemmini clients.
-  poke(c.io.matrixRead.get(0).req.valid, 1)
-  poke(c.io.matrixRead.get(0).req.bits.rowAddress, 0)
-  poke(c.io.matrixRead.get(1).req.valid, 1)
-  poke(c.io.matrixRead.get(1).req.bits.rowAddress, 1)
+  // Rows 0, 4, 8, and 12 are distinct SRAM rows in physical bank zero.
+  // Initialize them without contention, then keep all four read ports valid.
+  // The initial RR pointer is zero and advances to one past each winner.
+  val collisionRows = (0 until p.matrixPorts).map(_ * p.vSpadSubBanks)
+  val collisionData = (0 until p.matrixPorts).map { port =>
+    pattern(0x1000 + port * 0x100)
+  }
+  for (port <- 0 until p.matrixPorts) {
+    poke(c.io.matrixWrite.get(0).valid, 1)
+    poke(c.io.matrixWrite.get(0).bits.rowAddress, collisionRows(port))
+    for (lane <- 0 until p.nLanes) {
+      poke(c.io.matrixWrite.get(0).bits.data(lane),
+        collisionData(port)(lane))
+      poke(c.io.matrixWrite.get(0).bits.laneMask(lane), 1)
+    }
+    step(1)
+  }
+  poke(c.io.matrixWrite.get(0).valid, 0)
+
+  for (port <- 0 until p.matrixPorts) {
+    poke(c.io.matrixRead.get(port).req.valid, 1)
+    poke(c.io.matrixRead.get(port).req.bits.rowAddress,
+      collisionRows(port))
+    poke(c.io.matrixRead.get(port).resp.ready, 1)
+  }
+
+  val grantsPerPort = 4
+  val responseCounts = Array.fill(p.matrixPorts)(0)
+  def sampleResponses(): Unit = {
+    for (port <- 0 until p.matrixPorts) {
+      if (peek(c.io.matrixRead.get(port).resp.valid) == 1) {
+        for (lane <- 0 until p.nLanes) {
+          assert(peek(c.io.matrixRead.get(port).resp.bits.data(lane)) ==
+            collisionData(port)(lane),
+            s"port $port lane $lane received the wrong RR response")
+        }
+        responseCounts(port) += 1
+      }
+    }
+  }
+
+  for (cycle <- 0 until p.matrixPorts * grantsPerPort) {
+    val winners = (0 until p.matrixPorts).filter { port =>
+      peek(c.io.matrixRead.get(port).req.ready) == 1
+    }
+    assert(winners == Seq(cycle % p.matrixPorts),
+      s"physical-bank RR granted ${winners.mkString(",")} in cycle $cycle")
+    sampleResponses()
+    step(1)
+  }
+  for (port <- 0 until p.matrixPorts) {
+    poke(c.io.matrixRead.get(port).req.valid, 0)
+  }
+
+  var responseTimeout = 20
+  while (responseCounts.sum < p.matrixPorts * grantsPerPort &&
+      responseTimeout > 0) {
+    sampleResponses()
+    step(1)
+    responseTimeout -= 1
+  }
+  assert(responseTimeout > 0, "round-robin matrix responses timed out")
+  for (port <- 0 until p.matrixPorts) {
+    assert(responseCounts(port) == grantsPerPort,
+      s"port $port received ${responseCounts(port)} RR responses")
+    poke(c.io.matrixRead.get(port).resp.ready, 0)
+  }
+
+  // Rows 0..3 share logical bank zero but select physical sub-banks 0..3.
+  // They must be writable and readable by all four ports in the same cycle.
+  val parallelRows = 0 until p.matrixPorts
+  val parallelData = parallelRows.map { port =>
+    pattern(0x4000 + port * 0x100)
+  }
+  for (port <- 0 until p.matrixPorts) {
+    poke(c.io.matrixWrite.get(port).valid, 1)
+    poke(c.io.matrixWrite.get(port).bits.rowAddress, parallelRows(port))
+    for (lane <- 0 until p.nLanes) {
+      poke(c.io.matrixWrite.get(port).bits.data(lane), parallelData(port)(lane))
+      poke(c.io.matrixWrite.get(port).bits.laneMask(lane), 1)
+    }
+  }
   step(1)
+  for (port <- 0 until p.matrixPorts) {
+    poke(c.io.matrixWrite.get(port).valid, 0)
+    poke(c.io.matrixRead.get(port).req.valid, 1)
+    poke(c.io.matrixRead.get(port).req.bits.rowAddress, parallelRows(port))
+    assert(peek(c.io.matrixRead.get(port).req.ready) == 1,
+      s"different sub-bank request on port $port was serialized")
+  }
+  step(1)
+  for (port <- 0 until p.matrixPorts) {
+    poke(c.io.matrixRead.get(port).req.valid, 0)
+  }
+
+  var parallelTimeout = 20
+  while (!(0 until p.matrixPorts).forall { port =>
+      peek(c.io.matrixRead.get(port).resp.valid) == 1
+    } && parallelTimeout > 0) {
+    step(1)
+    parallelTimeout -= 1
+  }
+  assert(parallelTimeout > 0, "parallel sub-bank responses timed out")
+  for (port <- 0 until p.matrixPorts) {
+    for (lane <- 0 until p.nLanes) {
+      assert(peek(c.io.matrixRead.get(port).resp.bits.data(lane)) ==
+        parallelData(port)(lane),
+        s"port $port lane $lane received the wrong sub-bank response")
+    }
+    poke(c.io.matrixRead.get(port).resp.ready, 1)
+  }
+  step(1)
+  assert(peek(c.io.busy) == 0)
 }
 
 /** One 32-element Gemmini row is atomically split into two physical 16-lane
@@ -437,15 +547,13 @@ class VpuMatrixScratchpadSpec extends ChiselFlatSpec {
     } should be (true)
   }
 
-  it should "assert when two matrix clients use one logical bank" in {
+  it should "round-robin one physical bank and parallelize its sub-banks" in {
     val p = VpuMatrixScratchpadTestParams.p
-    assertThrows[treadle.executable.StopException] {
-      chisel3.iotesters.Driver.execute(Array(
-        "--backend-name", "treadle",
-        "--target-dir", "test_run_dir/vpu-matrix-bank-collision"),
-        () => new VpuBankedScratchpad(p)) { c =>
-        new VpuMatrixLogicalBankCollisionTester(c, p)
-      }
-    }
+    chisel3.iotesters.Driver.execute(Array(
+      "--backend-name", "treadle",
+      "--target-dir", "test_run_dir/vpu-matrix-bank-round-robin"),
+      () => new VpuBankedScratchpad(p)) { c =>
+      new VpuMatrixRoundRobinTester(c, p)
+    } should be (true)
   }
 }

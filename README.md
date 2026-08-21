@@ -292,6 +292,7 @@ vpu_flashattention_config_t config = {
     .queries = q, .keys = k, .values = v, .output = o,
     .query_rows = m, .sequence = n,
     .q_dim = d, .k_dim = d, .value_dim = dv,
+    .score_scale = 1.0f / sqrtf((float)d),
     .query_base = query_position,
     .query_stride = d, .key_stride = d,
     .value_stride = dv, .output_stride = dv,

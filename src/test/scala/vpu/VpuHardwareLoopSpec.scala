@@ -60,6 +60,8 @@ class VpuHardwareLoopTester(c: VpuHardwareLoop)
     var cycle = 0
     while ((peek(c.io.busy) == 1 || peek(c.io.out.valid) == 1) &&
         cycle < maxCycles) {
+      assert(peek(c.io.fenceBusy) == 1,
+        "autonomous loop replay dropped Rocket FENCE busy")
       val ready = !stall(cycle)
       poke(c.io.out.ready, if (ready) 1 else 0)
       if (ready && peek(c.io.out.valid) == 1) {
@@ -77,12 +79,16 @@ class VpuHardwareLoopTester(c: VpuHardwareLoop)
                               busyAfterFire: Boolean): Unit = {
     expect(c.io.protocolError, 1)
     expect(c.io.busy, 1)
+    expect(c.io.fenceBusy, 1)
     expect(c.io.out.valid, 1)
     expect(c.io.out.bits.malformed, 1)
     expect(c.io.out.bits.command.microOp, BigInt("8000000e", 16))
     expect(c.io.out.bits.last.get, if (last) 1 else 0)
     step(1)
     expect(c.io.busy, if (busyAfterFire) 1 else 0)
+    // A malformed region which remains busy is waiting for more input in
+    // sDrain; it must not hold Rocket's architectural FENCE.
+    expect(c.io.fenceBusy, 0)
     expect(c.io.protocolError, 0)
   }
 
@@ -108,6 +114,7 @@ class VpuHardwareLoopTester(c: VpuHardwareLoop)
   step(1)
   poke(c.io.in.valid, 0)
   expect(c.io.busy, 0)
+  expect(c.io.fenceBusy, 0)
 
   // A three-iteration loop captures without output and replays a stable body
   // under backpressure. The group terminator must be peeled outside the loop.
@@ -115,10 +122,14 @@ class VpuHardwareLoopTester(c: VpuHardwareLoop)
     rs1 = 1, rs2 = 2))
   enqueue(startWord(reg = 6, count = 3), group = 2, grouped = true)
   expect(c.io.busy, 1)
+  expect(c.io.fenceBusy, 0)
   expect(c.io.out.valid, 0)
   enqueue(simpleBody, payload = 0x1234, group = 2, grouped = true)
+  expect(c.io.fenceBusy, 0)
   enqueue(endWord(reg = 6), group = 2, grouped = true)
+  expect(c.io.fenceBusy, 1)
   val simple = drain(stall = cycle => cycle == 1 || cycle == 2)
+  expect(c.io.fenceBusy, 0)
   assert(simple.length == 3, s"expected 3 body commands, saw $simple")
   simple.foreach { command =>
     assert(command.word == simpleBody)

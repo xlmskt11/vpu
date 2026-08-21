@@ -60,6 +60,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
   step(1)
   poke(c.io.in.valid, 0)
   expect(c.io.busy, 0)
+  expect(c.io.fenceBusy, 0)
 
   // A live legacy/already-closed group explicitly rejects grouped commands;
   // the gate converts the command into an abort instead of waiting forever
@@ -88,6 +89,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
   expect(c.io.in.ready, 0)
   expect(c.io.group.pending, 1)
   expect(c.io.busy, 1)
+  expect(c.io.fenceBusy, 1)
 
   // The group controller raises dispatchEnable after all Gemmini commands are
   // registered. Permission alone still does not release a command while the
@@ -104,6 +106,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
   step(1)
   expect(c.io.in.ready, 1)
   expect(c.io.busy, 1) // sequence remains open until group_last
+  expect(c.io.fenceBusy, 0)
 
   // group_last cannot be captured in the one-entry buffer. Its RoCC input
   // handshake remains blocked until it can pass directly into VpuCore.
@@ -136,6 +139,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
   step(1)
   poke(c.io.in.valid, 0)
   expect(c.io.busy, 1)
+  expect(c.io.fenceBusy, 1)
 
   // Dispatch starts after the replacement group registers its Gemmini
   // children and raises dispatchEnable.
@@ -146,6 +150,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
   poke(c.io.group.dispatchEnable, 1)
   expect(c.io.out.valid, 1)
   step(1)
+  expect(c.io.fenceBusy, 0)
 
   drive(group = 2, grouped = true, last = true)
   poke(c.io.reservationAdmission, 1)
@@ -157,6 +162,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
   poke(c.io.group.groupAllocated, 0)
   poke(c.io.group.dispatchEnable, 0)
   expect(c.io.busy, 0)
+  expect(c.io.fenceBusy, 0)
   expect(c.io.fusionFault, 0)
 
   // A malformed group_last which arrives before LOOP_WS allocation is not
@@ -244,6 +250,7 @@ class VpuGroupCommandGateTester(c: VpuGroupCommandGate)
     0x80000000L))
   step(1)
   expect(c.io.busy, 1)
+  expect(c.io.fenceBusy, 0)
   drive(group = 3, grouped = true, last = true)
   expect(c.io.in.ready, 1)
   expect(c.io.out.valid, 0)

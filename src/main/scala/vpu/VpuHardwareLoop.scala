@@ -50,7 +50,14 @@ class VpuHardwareLoop(
       enableGroupedCommands)))
     val out = Decoupled(new VpuGroupedCommand(groupIdBits,
       enableGroupedCommands))
+    /** Full frontend state, including capture/drain states which require more
+      * software commands before they can make progress.
+      */
     val busy = Output(Bool())
+    /** Busy state safe to expose to Rocket's FENCE interlock.  Every state
+      * represented here makes progress without another command from the CPU.
+      */
+    val fenceBusy = Output(Bool())
     /** One-cycle pulse when a malformed loop region is accepted or detected. */
     val protocolError = Output(Bool())
   })
@@ -434,6 +441,12 @@ class VpuHardwareLoop(
   }
 
   io.busy := state =/= sPass
+  // Capture and drain wait for LOOP_END (or more malformed-stream input).
+  // Including them in RoCC busy creates a scheduler deadlock: Linux FENCE
+  // waits for busy to clear while the preempted task is the only producer of
+  // the command which can close the region. Replay and error delivery are
+  // autonomous once entered and must remain ordered before a CPU FENCE.
+  io.fenceBusy := state === sReplay || state === sError
   io.protocolError := protocolError
 
   dontTouch(state)
@@ -444,5 +457,6 @@ class VpuHardwareLoop(
   dontTouch(replayRemaining)
   dontTouch(drainDepth)
   dontTouch(io.busy)
+  dontTouch(io.fenceBusy)
   dontTouch(io.protocolError)
 }

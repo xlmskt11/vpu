@@ -125,7 +125,6 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     }
   }
   private val matrixBanks = matrixAddresses.map(_.map(bank))
-  private val matrixLogicalBanks = matrixAddresses.map(_.map(logicalBank))
   private val matrixRows = matrixAddresses.map(_.map(row))
   private val matrixBankMasks = matrixBanks.map { fragments =>
     fragments.map { selectedBank =>
@@ -140,30 +139,71 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     io.matrixRead.get(port).req.valid && matrixCredit(port)
   }
 
-  // Software assigns each active Gemmini a distinct logical VSRAM bank. A
-  // violation is a programming error rather than a reason to drop a Valid
-  // matrix write later in the pipeline.
-  for (lhs <- 0 until p.matrixPorts; rhs <- lhs + 1 until p.matrixPorts) {
-    assert(!(io.matrixRead.get(lhs).req.valid &&
-      io.matrixRead.get(rhs).req.valid &&
-      matrixLogicalBanks(lhs).head === matrixLogicalBanks(rhs).head),
-      "two Gemminis requested the same logical VSRAM read bank")
+  // A matrix row may span multiple consecutive physical banks. Its fragments
+  // form one aligned bank group, so arbitrate the complete group atomically:
+  // independent groups proceed together while contenders for the same group
+  // receive round-robin service. In the production fusion configuration one
+  // matrix row is one VSRAM word, making this exactly one RR arbiter per
+  // physical bank (logical bank plus sub-bank).
+  private val matrixBanksPerGroup = p.matrixWordsPerRow
+  require(p.vSpadSubBanks % matrixBanksPerGroup == 0,
+    "matrix rows must occupy aligned VSRAM physical-bank groups")
+  private val matrixBankGroupCount = p.physicalBanks / matrixBanksPerGroup
+  private val matrixBankGroups = matrixBanks.map { fragments =>
+    fragments.head / matrixBanksPerGroup.U
+  }
+  private val matrixRrPointerBits =
+    math.max(1, log2Ceil(math.max(1, p.matrixPorts)))
+  private val matrixRrPointers = if (p.matrixPorts > 0) {
+    Seq.fill(matrixBankGroupCount) {
+      RegInit(0.U(matrixRrPointerBits.W))
+    }
+  } else {
+    Seq.empty
+  }
+  private val matrixSelectedMasks = if (p.matrixPorts > 0) {
+    (0 until matrixBankGroupCount).map { group =>
+      val candidateMask = VecInit((0 until p.matrixPorts).map { port =>
+        matrixContender(port) && matrixBankGroups(port) === group.U
+      }).asUInt
+      val rotatedCandidates = candidateMask.rotateRight(matrixRrPointers(group))
+      val rotatedWinner = PriorityEncoderOH(rotatedCandidates)
+      Mux(candidateMask.orR,
+        rotatedWinner.rotateLeft(matrixRrPointers(group)),
+        0.U(p.matrixPorts.W))
+    }
+  } else {
+    Seq.empty
   }
 
-  for (port <- 0 until p.matrixPorts) {
-    val earlierSamePhysical = (0 until port).map { earlier =>
-      matrixContender(earlier) &&
-        (matrixBankMasks(earlier) & matrixBankMasks(port)).orR
-    }.reduceOption(_ || _).getOrElse(false.B)
-    io.matrixRead.get(port).req.ready := matrixCredit(port) &&
-      !earlierSamePhysical
+  if (p.matrixPorts > 0) {
+    for (port <- 0 until p.matrixPorts) {
+      val selected = (0 until matrixBankGroupCount).map { group =>
+        matrixBankGroups(port) === group.U && matrixSelectedMasks(group)(port)
+      }.reduce(_ || _)
+      io.matrixRead.get(port).req.ready := matrixCredit(port) && selected
+    }
   }
 
   private val acceptingMatrixRead = (0 until p.matrixPorts).map { port =>
     io.matrixRead.get(port).req.fire
   }
+  if (p.matrixPorts > 0) {
+    for (group <- 0 until matrixBankGroupCount) {
+      val fireMask = VecInit((0 until p.matrixPorts).map { port =>
+        acceptingMatrixRead(port) && matrixBankGroups(port) === group.U
+      }).asUInt
+      assert(PopCount(fireMask) <= 1.U,
+        "one VSRAM matrix bank group granted multiple ports")
+      when (fireMask.orR) {
+        val winner = OHToUInt(fireMask)
+        matrixRrPointers(group) := Mux(winner === (p.matrixPorts - 1).U,
+          0.U, winner + 1.U)
+      }
+    }
+  }
   private val matrixClaimedBankMask = if (p.matrixPorts > 0) {
-    matrixContender.zip(matrixBankMasks).map { case (valid, selectedBanks) =>
+    acceptingMatrixRead.zip(matrixBankMasks).map { case (valid, selectedBanks) =>
       Mux(valid, selectedBanks,
         0.U(p.physicalBanks.W))
     }.reduce(_ | _)
@@ -360,8 +400,6 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
     }
   }
   private val matrixWriteBanks = matrixWriteAddresses.map(_.map(bank))
-  private val matrixWriteLogicalBanks =
-    matrixWriteAddresses.map(_.map(logicalBank))
   private val matrixWriteRows = matrixWriteAddresses.map(_.map(row))
   private val matrixWriteBankMasks = matrixWriteBanks.map { fragments =>
     fragments.map { selectedBank =>
@@ -387,11 +425,14 @@ class VpuBankedScratchpad(p: VpuParams) extends Module {
         "Gemmini VSRAM matrix write row is out of range")
     }
   }
+  // Matrix writes are Valid-only, so unlike reads they cannot be serialized
+  // here. The fusion configuration preserves Gemmini ACC sub-bank ownership
+  // in this physical-bank mapping; retain a local assertion against any
+  // integration or software violation of that contract.
   for (lhs <- 0 until p.matrixPorts; rhs <- lhs + 1 until p.matrixPorts) {
     assert(!(matrixWriteValid(lhs) && matrixWriteValid(rhs) &&
-      matrixWriteLogicalBanks(lhs).head ===
-        matrixWriteLogicalBanks(rhs).head),
-      "two Gemminis wrote the same logical VSRAM bank")
+      (matrixWriteBankMasks(lhs) & matrixWriteBankMasks(rhs)).orR),
+      "two Gemminis wrote overlapping physical VSRAM banks")
   }
 
   private val writesOverlap = io.writeRequest(0).valid &&

@@ -107,7 +107,7 @@ class VpuRoCCModule(outer: VpuRoCC)
   hardwareLoop.io.in.valid := io.cmd.valid
   hardwareLoop.io.in.bits := transportGrouped
   io.cmd.ready := hardwareLoop.io.in.ready
-  val groupGateBusy = WireDefault(false.B)
+  val groupGateFenceBusy = WireDefault(false.B)
 
   io.resp.valid := core.io.response.valid
   io.resp.bits.rd := core.io.response.bits.rd
@@ -131,10 +131,11 @@ class VpuRoCCModule(outer: VpuRoCC)
     gate.io.group.dispatchReject := group.dispatchReject
     group.lastDispatchFire := gate.io.group.lastDispatchFire
     group.abort := gate.io.group.abort
-    groupGateBusy := gate.io.busy
+    groupGateFenceBusy := gate.io.fenceBusy
     core.io.fusionFault.get := gate.io.fusionFault
 
     dontTouch(gate.io.busy)
+    dontTouch(gate.io.fenceBusy)
     dontTouch(gate.io.protocolError)
   } else {
     core.io.command.valid := hardwareLoop.io.out.valid
@@ -150,8 +151,12 @@ class VpuRoCCModule(outer: VpuRoCC)
   outer.memory.module.io.dma <> core.io.dma
   io.ptw.head <> outer.memory.module.io.ptw
 
+  // Rocket stalls every architectural FENCE while RoCC busy is asserted.
+  // Only include states which can drain without another CPU command. Open
+  // loop/group protocols remain visible through their full `busy` outputs,
+  // but excluding them here lets a preempted task return and close the stream.
   val acceleratorBusy = core.io.busy || outer.memory.module.io.busy ||
-    groupGateBusy || hardwareLoop.io.busy
+    groupGateFenceBusy || hardwareLoop.io.fenceBusy
   io.busy := acceleratorBusy
   io.interrupt := false.B
 
@@ -170,5 +175,6 @@ class VpuRoCCModule(outer: VpuRoCC)
   dontTouch(core.io.status)
   dontTouch(core.io.perfCounters)
   dontTouch(hardwareLoop.io.busy)
+  dontTouch(hardwareLoop.io.fenceBusy)
   dontTouch(hardwareLoop.io.protocolError)
 }
